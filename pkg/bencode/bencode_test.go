@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -288,4 +290,76 @@ func TestEncodeDecode(t *testing.T) {
 			assert.Equal(t, tt.value, got)
 		})
 	}
+}
+
+func TestDecode_RealTorrentFile(t *testing.T) {
+	t.Parallel()
+
+	matches, err := filepath.Glob(filepath.Join("testdata", "*.torrent"))
+	require.NoError(t, err)
+	require.NotEmpty(t, matches, "no .torrent file found in testdata")
+
+	f, err := os.Open(matches[0])
+	require.NoError(t, err)
+	defer f.Close()
+
+	v, err := Decode(f)
+	require.NoError(t, err)
+
+	root, ok := v.(Dict)
+	require.True(t, ok, "top-level value must be a dict")
+
+	announce, ok := root["announce"].(Str)
+	require.True(t, ok, "missing announce string")
+	assert.NotEmpty(t, announce)
+
+	infoVal, ok := root["info"]
+	require.True(t, ok, "missing info dict")
+	info, ok := infoVal.(Dict)
+	require.True(t, ok, "info must be a dict")
+
+	name, ok := info["name"].(Str)
+	require.True(t, ok, "missing info.name")
+	assert.NotEmpty(t, name)
+
+	pieceLen, ok := info["piece length"].(Int)
+	require.True(t, ok, "missing info.piece length")
+	assert.Greater(t, pieceLen, Int(0))
+
+	pieces, ok := info["pieces"].(Str)
+	require.True(t, ok, "missing info.pieces")
+	require.NotZero(t, len(pieces))
+	assert.Zero(t, len(pieces)%20, "pieces must be a concatenation of 20-byte SHA-1 hashes")
+
+	files, ok := info["files"].(List)
+	require.True(t, ok, "missing info.files")
+	assert.NotEmpty(t, files)
+	for _, fv := range files {
+		fd, ok := fv.(Dict)
+		require.True(t, ok, "each file entry must be a dict")
+		assert.Contains(t, fd, "length")
+		assert.Contains(t, fd, "path")
+	}
+}
+
+func TestEncodeDecode_RealTorrentFile(t *testing.T) {
+	t.Parallel()
+
+	matches, err := filepath.Glob(filepath.Join("testdata", "*.torrent"))
+	require.NoError(t, err)
+	require.NotEmpty(t, matches, "no .torrent file found in testdata")
+
+	raw, err := os.ReadFile(matches[0])
+	require.NoError(t, err)
+
+	v, err := Decode(bytes.NewReader(raw))
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, Encode(&buf, v))
+
+	v2, err := Decode(&buf)
+	require.NoError(t, err)
+
+	assert.Equal(t, v, v2, "re-encoding a decoded real torrent must round-trip to an equal value")
 }
