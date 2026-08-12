@@ -1,9 +1,12 @@
 package bencode
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 )
 
 /*
@@ -30,6 +33,13 @@ d3:keki4ee -> {"kek": 4}
 d3:cow3:moo4:spam4:eggse → {"cow": "moo", "spam": "eggs"}
 */
 
+const MaxStringLenDigits = 6
+
+var ErrMaxStringLenDigits = errors.New("string length digits exceeds max")
+var ErrLeadingZero = errors.New("leading zero")
+var ErrNegativeZero = errors.New("negative zero")
+var ErrEmpty = errors.New("empty")
+
 type Value interface{ bencode() }
 
 type Str []byte
@@ -42,51 +52,179 @@ func (Int) bencode()  {}
 func (List) bencode() {}
 func (Dict) bencode() {}
 
-func encode(w io.Writer, v Value) (err error) {
+func encode(w io.Writer, v Value) {
 	switch v := v.(type) {
 	case Str:
-		_, err = fmt.Fprintf(w, "%d:%s", len(v), v)
+		fmt.Fprintf(w, "%d:%s", len(v), v)
 	case Int:
-		_, err = fmt.Fprintf(w, "i%de", v)
+		fmt.Fprintf(w, "i%de", v)
 	case List:
-		_, err = io.WriteString(w, "l")
-		if err != nil {
-			return err
-		}
+		io.WriteString(w, "l")
 		for _, ll := range v {
-			err = encode(w, ll)
-			if err != nil {
-				return err
-			}
+			encode(w, ll)
 		}
-		_, err = io.WriteString(w, "e")
-		if err != nil {
-			return err
-		}
+		io.WriteString(w, "e")
 	case Dict:
-		_, err = io.WriteString(w, "d")
-		if err != nil {
-			return err
-		}
+		io.WriteString(w, "d")
 		keys := make([]string, 0, len(v))
 		for k := range v {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			if err = encode(w, Str(k)); err != nil {
-				return err
-			}
-			if err = encode(w, v[k]); err != nil {
-				return err
-			}
+			encode(w, Str(k))
+			encode(w, v[k])
 		}
-		_, err = io.WriteString(w, "e")
-		if err != nil {
-			return err
-		}
+		io.WriteString(w, "e")
 	default:
-		return fmt.Errorf("unknown bencode value %T", v)
+		panic(fmt.Sprintf("unknown bencode value %T", v))
 	}
-	return err
+}
+
+func decode(br *bufio.Reader) (Value, error) {
+	b, err := br.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	switch b {
+	case 'd':
+		d := Dict{}
+		var key string
+		for {
+			db, err := br.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			if db == 'e' {
+				break
+			}
+
+			err = br.UnreadByte()
+			if err != nil {
+				return nil, err
+			}
+
+			v, err := decode(br)
+			if err != nil {
+				return nil, err
+			}
+
+			vk, ok := v.(Str)
+			if key == "" && !ok {
+				return nil, fmt.Errorf("dictionary key must be string, but got: %T", v)
+			} else if key == "" {
+				key = string(vk)
+			} else {
+				d[key] = v
+				key = ""
+			}
+		}
+
+		return d, nil
+	case 'l':
+		l := List{}
+
+		for {
+			lb, err := br.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			if lb == 'e' {
+				break
+			}
+
+			err = br.UnreadByte()
+			if err != nil {
+				return nil, err
+			}
+
+			v, err := decode(br)
+			if err != nil {
+				return nil, err
+			}
+
+			l = append(l, v)
+		}
+		return l, nil
+	case 'i':
+		iStr, err := br.ReadString('e')
+		if err != nil {
+			return nil, err
+		}
+		iStr = iStr[:len(iStr)-1]
+
+		if len(iStr) == 0 {
+			return nil, ErrEmpty
+		}
+		if iStr[0] == '0' && len(iStr) > 1 {
+			return nil, ErrLeadingZero
+		}
+		if iStr[0] == '-' && len(iStr) > 1 && iStr[1] == '0' {
+			return nil, ErrNegativeZero
+		}
+
+		iInt, err := strconv.Atoi(iStr)
+		if err != nil {
+			return nil, err
+		}
+
+		return Int(iInt), nil
+	default:
+		lengthStr, err := br.ReadString(':')
+		if err != nil {
+			return nil, err
+		}
+
+		lengthStr = string(b) + lengthStr[:len(lengthStr)-1]
+
+		if len(lengthStr) == 0 {
+			return nil, ErrEmpty
+		}
+
+		if len(lengthStr) > MaxStringLenDigits {
+			return nil, ErrMaxStringLenDigits
+		}
+
+		lengthInt, err := strconv.Atoi(lengthStr)
+		if err != nil {
+			return nil, err
+		}
+
+		str := make([]byte, lengthInt)
+		n, err := io.ReadFull(br, str)
+		if err != nil {
+			return nil, err
+		}
+		if n != lengthInt {
+			return nil, fmt.Errorf("read length and string length are not the same")
+		}
+
+		return Str(str), nil
+	}
+}
+
+type errWriter struct {
+	err error
+	w   io.Writer
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	var n int
+	n, e.err = e.w.Write(p)
+	return n, e.err
+}
+
+func Encode(w io.Writer, v Value) error {
+	ew := &errWriter{w: w}
+	encode(ew, v)
+	return ew.err
+}
+
+func Decode(r io.Reader) (Value, error) {
+	return decode(bufio.NewReader(r))
+
 }
