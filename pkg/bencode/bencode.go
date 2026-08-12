@@ -35,10 +35,13 @@ d3:cow3:moo4:spam4:eggse → {"cow": "moo", "spam": "eggs"}
 
 const MaxStringLenDigits = 6
 
-var ErrMaxStringLenDigits = errors.New("string length digits exceeds max")
-var ErrLeadingZero = errors.New("leading zero")
-var ErrNegativeZero = errors.New("negative zero")
-var ErrEmpty = errors.New("empty")
+var (
+	ErrDictKeyMustBeStr   = errors.New("dictionary key must be string")
+	ErrMaxStringLenDigits = errors.New("string length digits exceeds max")
+	ErrLeadingZero        = errors.New("leading zero")
+	ErrNegativeZero       = errors.New("negative zero")
+	ErrEmpty              = errors.New("empty")
+)
 
 type Value interface{ bencode() }
 
@@ -112,7 +115,7 @@ func decode(br *bufio.Reader) (Value, error) {
 
 			vk, ok := v.(Str)
 			if key == "" && !ok {
-				return nil, fmt.Errorf("dictionary key must be string, but got: %T", v)
+				return nil, fmt.Errorf("%w, but got: %T", ErrDictKeyMustBeStr, v)
 			} else if key == "" {
 				key = string(vk)
 			} else {
