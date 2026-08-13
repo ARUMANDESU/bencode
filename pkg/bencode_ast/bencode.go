@@ -1,4 +1,4 @@
-package bencode
+package bencode_ast
 
 import (
 	"bufio"

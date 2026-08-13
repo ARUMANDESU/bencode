@@ -1,4 +1,4 @@
-package bencode
+package bencode_ast
 
 import (
 	"bytes"
@@ -295,7 +295,7 @@ func TestEncodeDecode(t *testing.T) {
 func TestDecode_RealTorrentFile(t *testing.T) {
 	t.Parallel()
 
-	matches, err := filepath.Glob(filepath.Join("testdata", "*.torrent"))
+	matches, err := filepath.Glob(filepath.Join("..", "..", "testdata", "*.torrent"))
 	require.NoError(t, err)
 	require.NotEmpty(t, matches, "no .torrent file found in testdata")
 
@@ -345,7 +345,7 @@ func TestDecode_RealTorrentFile(t *testing.T) {
 func TestEncodeDecode_RealTorrentFile(t *testing.T) {
 	t.Parallel()
 
-	matches, err := filepath.Glob(filepath.Join("testdata", "*.torrent"))
+	matches, err := filepath.Glob(filepath.Join("..", "..", "testdata", "*.torrent"))
 	require.NoError(t, err)
 	require.NotEmpty(t, matches, "no .torrent file found in testdata")
 
