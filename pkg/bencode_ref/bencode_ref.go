@@ -19,6 +19,15 @@ var (
 	ErrNegativeZero       = errors.New("negative zero")
 	ErrEmpty              = errors.New("empty")
 	ErrMaxStringLenDigits = errors.New("string length digits exceeds max")
+
+	ErrTypeMismatch = errors.New("type mismatch")
+	// ErrOverflow: the value parsed, but does not fit the destination's width.
+	ErrOverflow = errors.New("value overflows destination")
+	// ErrInvalidDestination: the destination itself is unusable — non-pointer,
+	// nil pointer, or an unsettable reflect.Value.
+	ErrInvalidDestination = errors.New("invalid destination")
+	// ErrMaxDepth: nesting exceeded the decoder's recursion limit.
+	ErrMaxDepth = errors.New("max nesting depth exceeded")
 )
 
 type Decoder struct {
@@ -31,7 +40,7 @@ func NewDecoder(r io.Reader) *Decoder {
 
 func (d *Decoder) Decode(a any) error {
 	v := reflect.ValueOf(a)
-	if v.Kind() != reflect.Ptr {
+	if v.Kind() != reflect.Pointer {
 		return fmt.Errorf("non-pointer destionation TODO")
 	}
 	return d.decode(v.Elem())
@@ -51,7 +60,6 @@ func (d *Decoder) decode(v reflect.Value) error {
 	case b == 'i':
 		return d.decodeInt(v)
 	case b >= '0' && b <= '9':
-		d.br.UnreadByte()
 		return d.decodeString(v)
 	default:
 		return fmt.Errorf("%w: unexpected %q", ErrSyntax, b)
@@ -64,7 +72,12 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 		t := v.Type()
 		tags := make(map[string]reflect.Value, t.NumField())
 		for i := 0; i < t.NumField(); i++ {
-			tags[t.Field(i).Tag.Get(tagName)] = v.Field(i)
+			field := t.Field(i)
+			tag := field.Tag.Get(tagName)
+			if len(tag) == 0 || tag == "-" || !field.IsExported() {
+				continue
+			}
+			tags[tag] = v.Field(i)
 		}
 
 		for {
@@ -88,7 +101,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 
 			fieldDst, ok := tags[key]
 			if !ok {
-				err = d.Skip()
+				err = d.skip()
 				if err != nil {
 					return err
 				}
@@ -133,6 +146,14 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 		}
 		v.Set(m)
 	default:
+		err := d.br.UnreadByte()
+		if err != nil {
+			return err
+		}
+		err = d.skip()
+		if err != nil {
+			return errors.Join(ErrSyntax, err)
+		}
 		return ErrSyntax
 	}
 
@@ -176,7 +197,7 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 
 		v.Set(s)
 	case reflect.Array:
-		s := reflect.New(reflect.ArrayOf(v.Len(), v.Type().Elem()))
+		s := reflect.New(reflect.ArrayOf(v.Len(), v.Type().Elem())).Elem()
 
 		i := 0
 		for {
@@ -187,17 +208,16 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 			if lb == 'e' {
 				break
 			}
+			err = d.br.UnreadByte()
+			if err != nil {
+				return err
+			}
 			if i >= v.Len() {
-				err = d.Skip()
+				err = d.skip()
 				if err != nil {
 					return err
 				}
 				continue
-			}
-
-			err = d.br.UnreadByte()
-			if err != nil {
-				return err
 			}
 
 			elem := reflect.New(v.Type().Elem())
@@ -211,6 +231,16 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 		}
 
 		v.Set(s)
+	default:
+		err := d.br.UnreadByte()
+		if err != nil {
+			return err
+		}
+		err = d.skip()
+		if err != nil {
+			return errors.Join(ErrSyntax, err)
+		}
+		return fmt.Errorf("TODO")
 	}
 	return nil
 }
@@ -235,24 +265,59 @@ func (d *Decoder) decodeInt(v reflect.Value) error {
 		return ErrNegativeZero
 	}
 
-	iInt, err := strconv.Atoi(iStr)
-	if err != nil {
-		return err
-	}
-
 	switch k := v.Kind(); k {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		iInt, err := strconv.ParseInt(iStr, 10, 64)
+		if err != nil {
+			return err
+		}
+		if v.OverflowInt(iInt) {
+			return fmt.Errorf("TODO")
+		}
 		v.SetInt(int64(iInt))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		v.SetUint(uint64(iInt))
+		iUint, err := strconv.ParseUint(iStr, 10, 64)
+		if err != nil {
+			return err
+		}
+		if v.OverflowUint(iUint) {
+			return fmt.Errorf("TODO")
+		}
+		v.SetUint(uint64(iUint))
+	case reflect.Float32, reflect.Float64:
+		iFloat, err := strconv.ParseFloat(iStr, 64)
+		if err != nil {
+			return err
+		}
+		if v.OverflowFloat(iFloat) {
+			return fmt.Errorf("TODO")
+		}
+		v.SetFloat(iFloat)
 	case reflect.Interface:
+		iInt, err := strconv.ParseInt(iStr, 10, 64)
+		if err != nil {
+			return err
+		}
 		v.Set(reflect.ValueOf(int64(iInt)))
 	default:
+		err := d.br.UnreadByte()
+		if err != nil {
+			return err
+		}
+		err = d.skip()
+		if err != nil {
+			return errors.Join(ErrSyntax, err)
+		}
 		return fmt.Errorf("TODO")
 	}
 	return nil
 }
 func (d *Decoder) decodeString(v reflect.Value) error {
+	err := d.br.UnreadByte()
+	if err != nil {
+		return err
+	}
+
 	if !v.CanSet() {
 		return fmt.Errorf("TODO")
 	}
@@ -266,6 +331,10 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 
 	if len(lengthStr) == 0 {
 		return ErrEmpty
+	}
+
+	if lengthStr[0] == '0' && len(lengthStr) > 1 {
+		return ErrLeadingZero
 	}
 
 	if len(lengthStr) > MaxStringLenDigits {
@@ -297,7 +366,7 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 	return nil
 }
 
-func (d *Decoder) Skip() error {
+func (d *Decoder) skip() error {
 	var discard any
 	if err := d.decode(reflect.ValueOf(&discard).Elem()); err != nil {
 		return err
