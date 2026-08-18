@@ -34,12 +34,28 @@ var (
 	ErrMaxDepth = errors.New("max nesting depth exceeded")
 )
 
+type RawMessage []byte
+
+var rawMessageType = reflect.TypeFor[RawMessage]()
+
+type reader interface {
+	io.ByteScanner
+	io.Reader
+}
+
+type discarder interface {
+	Discard(n int) (int, error)
+}
+
 type Decoder struct {
-	br    *bufio.Reader
+	br    reader
 	depth uint
 }
 
 func NewDecoder(r io.Reader) *Decoder {
+	if br, ok := r.(reader); ok {
+		return &Decoder{br: br}
+	}
 	return &Decoder{br: bufio.NewReader(r)}
 }
 
@@ -56,6 +72,15 @@ func (d *Decoder) decode(v reflect.Value) error {
 	defer func() { d.depth-- }()
 	if d.depth >= MaxRecurtionDepth {
 		return ErrMaxDepth
+	}
+
+	if v.Type() == rawMessageType {
+		raw, err := d.readRawValue()
+		if err != nil {
+			return err
+		}
+		v.SetBytes(raw)
+		return nil
 	}
 
 	b, err := d.br.ReadByte()
@@ -107,13 +132,16 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				return err
 			}
 
-			var key string
+			var key any
 			keyDst := reflect.ValueOf(&key).Elem()
 			if err := d.decode(keyDst); err != nil {
 				return err
 			}
+			if keyDst.Elem().Kind() != reflect.String {
+				return fmt.Errorf("%w: dict key must be string, not: %s", ErrSyntax, keyDst.Elem().Kind().String())
+			}
 
-			fieldDst, ok := tags[key]
+			fieldDst, ok := tags[key.(string)]
 			if !ok {
 				err = d.skipValue()
 				if err != nil {
@@ -145,13 +173,13 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				return err
 			}
 
-			var key string
+			var key any
 			keyDst := reflect.ValueOf(&key).Elem()
 			if err := d.decode(keyDst); err != nil {
 				return err
 			}
-			if reflect.ValueOf(key).Kind() != reflect.String {
-				return ErrTypeMismatch
+			if keyDst.Elem().Kind() != reflect.String {
+				return fmt.Errorf("%w: dict key must be string, not: %s", ErrSyntax, keyDst.Elem().Kind().String())
 			}
 
 			fieldDst := reflect.New(t.Elem())
@@ -331,12 +359,18 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 		return err
 	}
 
-	switch k := v.Kind(); {
-	case k == reflect.String:
+	switch k := v.Kind(); k {
+	case reflect.String:
 		v.SetString(string(str))
-	case k == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
+	case reflect.Slice:
 		v.SetBytes(str)
-	case k == reflect.Interface:
+	case reflect.Array:
+		if v.Len() != len(str) {
+			return ErrTypeMismatch
+		}
+
+		v.SetBytes(str)
+	case reflect.Interface:
 		v.Set(reflect.ValueOf(string(str)))
 	default:
 		return ErrTypeMismatch
@@ -396,7 +430,7 @@ func (d *Decoder) skipDictList() error {
 }
 
 func (d *Decoder) skipInt() error {
-	_, err := d.br.ReadString('e')
+	_, err := d.readInt()
 	if err != nil {
 		return err
 	}
@@ -415,7 +449,7 @@ func (d *Decoder) skipString() error {
 		return err
 	}
 
-	_, err = d.br.Discard(lengthInt)
+	_, err = d.discard(lengthInt)
 	if err != nil {
 		return err
 	}
@@ -423,16 +457,33 @@ func (d *Decoder) skipString() error {
 	return nil
 }
 
-func (d *Decoder) readSlice(delim byte, limit int) ([]byte, error) {
+func (d *Decoder) discard(n int) (int, error) {
+	if n < 0 {
+		return 0, bufio.ErrNegativeCount
+	}
+	if dr, ok := d.br.(discarder); ok {
+		return dr.Discard(n)
+	}
+	m, err := io.CopyN(io.Discard, d.br, int64(n))
+	return int(m), err
+}
+
+func (d *Decoder) readIntSlice(delim byte, limit int) ([]byte, error) {
 	var buf []byte
 	n := 0
 	for {
 		b, err := d.br.ReadByte()
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
 		if b == delim {
 			break
+		}
+		if (b < '0' || b > '9') && (b != '-' || n != 0) {
+			return nil, ErrSyntax
 		}
 		if n == limit {
 			return nil, ErrExceedsMax
@@ -443,24 +494,33 @@ func (d *Decoder) readSlice(delim byte, limit int) ([]byte, error) {
 	if n == 0 {
 		return nil, ErrEmpty
 	}
+	if n == 1 && buf[0] == '-' {
+		return nil, ErrSyntax
+	}
 
 	return buf, nil
 }
 
 func (d *Decoder) readStrLen() (int, error) {
-	buf, err := d.readSlice(':', MaxStringLenDigits)
+	buf, err := d.readIntSlice(':', MaxStringLenDigits)
 	if err != nil {
 		return 0, err
 	}
 	if buf[0] == '0' && len(buf) > 1 {
 		return 0, ErrLeadingZero
 	}
+	if buf[0] == '-' {
+		return 0, ErrSyntax
+	}
 	return strconv.Atoi(string(buf))
 }
 
 func (d *Decoder) readInt() (string, error) {
-	buf, err := d.readSlice('e', MaxIntDigits)
+	buf, err := d.readIntSlice('e', MaxIntDigits)
 	if err != nil {
+		if errors.Is(err, ErrExceedsMax) {
+			return "", ErrOverflow
+		}
 		return "", err
 	}
 	bufLen := len(buf)
@@ -475,4 +535,8 @@ func (d *Decoder) readInt() (string, error) {
 		return "", ErrNegativeZero
 	}
 	return string(buf), nil
+}
+
+func (d *Decoder) readRawValue() ([]byte, error) {
+	return nil, nil
 }

@@ -263,6 +263,7 @@ for the same digit count.
 | `MaxStringBytes` | 8 MiB | against the **declared** length, before any allocation |
 | `MaxDepth` | 128 | on entry to each nested container |
 | `MaxIntBytes` (internal) | 64 | on the scan for the `e` terminator |
+| `MaxCaptureBytes` | 8 MiB | on the §9.6 retention window, as it grows |
 
 Rules:
 
@@ -295,28 +296,142 @@ must be guarded by a type check that returns `ErrTypeMismatch` first.
 type RawMessage []byte
 ```
 
-Decoding any value into a `RawMessage` copies the **verbatim bytes of the
-complete value**, including type prefixes, length prefixes and terminators.
+### 9.1 Semantics
+
+Decoding any value into a `RawMessage` yields the **verbatim bytes of the
+complete value**: type prefix, length prefix and terminator included.
+
+| input | `RawMessage` receives |
+|---|---|
+| `i4e` | `i4e` |
+| `6:string` | `6:string` |
+| `li4ee` | `li4ee` |
+| `d6:lengthi7ee` | `d6:lengthi7ee` |
+
+Content-only was rejected. Whole-value is what both callers need:
+
+- **re-hashing** wants exactly the bytes that were on the wire
+- **deferred decoding** wants something that is still a bencode value, so it
+  can be fed back through a `Decoder` later
+
+Content-only breaks deferred decoding for every type — `string` is not a
+bencode value, neither is `4`, neither are a list's innards — and for strings
+it would merely duplicate `[]byte`. The division of labour is:
+
+> `[]byte` gives you the **content**. `RawMessage` gives you the **value**.
+
+This is the same choice `encoding/json` makes: a `json.RawMessage` holds
+`{"a":1}` with its braces and `"foo"` with its quotes.
+
+### 9.2 Guarantees
+
+1. **Round trip.** For any value `v` captured as `raw`, feeding `raw` to a
+   fresh `Decoder` produces a decode identical to decoding `v` in place.
+2. **Byte exactness.** `raw` is the input's bytes, not a re-encoding. §2
+   leniency means key order and non-canonical encodings are *not* recoverable
+   by re-encoding, which is the whole reason this type exists — a torrent's
+   infohash is `sha1(raw bytes of the info dict)`.
+3. **Ownership.** `RawMessage` never aliases the decoder's buffers. The caller
+   may retain and mutate it freely.
+
+### 9.3 Why it is specified before it is built
+
+Capture is not a feature you can bolt on: it constrains how the decoder is
+allowed to read. Writing it down now costs nothing and prevents a read path
+that cannot support it.
+
+### 9.4 Capture is skipping, with recording on
+
+A list or dict carries no length prefix, so its extent is only knowable by
+parsing it. The decoder already owns the machine that does this: `skipValue`
+walks exactly one complete value and stops on its matching terminator, at any
+nesting depth.
+
+> **`RawMessage` = `skipValue()` with recording turned on.**
+
+One code path for all four types. Lists and dicts are not special-cased; the
+recursive walk finds the end for free.
+
+### 9.5 Mechanism: offset-corrected tee
+
+The decoder is a **stream** decoder (it must serve the peer wire protocol, not
+only whole `.torrent` files), so buffering the entire input and subslicing it
+is not available.
+
+**Rejected: teeing the `io.Reader`.** A recorder wrapped around the source runs
+on the *refill* clock — bytes pulled into `bufio`'s buffer — while the parser
+runs on the *consume* clock. `bufio` reads ahead, so the two are separated by
+an arbitrary gap that depends on buffer size, source chunking and, on a socket,
+packet timing. Capture marks taken on the refill clock are meaningless, and
+they fail non-deterministically: a plausible-looking but wrong hash.
+
+**Adopted: record at the source, convert the clock.** `bufio.Reader.Buffered()`
+reports how many bytes are read but not yet consumed, so at any instant
+
+```
+consumed = bytesPulledFromSource - br.Buffered()
+```
+
+is the parser's exact stream offset. A capture is then a pair of `consumed`
+offsets taken before and after the walk of §9.4, and the payload is that range
+of the recorded bytes.
+
+Worked example — input `d4:infod6:lengthi7ee8:announce3:abce`, 36 bytes, all of
+which `bufio` pulls on the first `ReadByte`:
+
+| moment | pulled | `Buffered()` | `consumed` |
+|---|---|---|---|
+| capture start | 36 | 29 | **7** |
+| capture end | 36 | 16 | **20** |
+
+`recorded[7:20]` is `d6:lengthi7ee`. The correction stays exact when the source
+delivers in unpredictable chunks, which is the case that matters on a socket.
+
+**Why not record at every consumption site.** Appending inside `readSlice`,
+`decodeString`, `skipString`, `skipInt`, `Discard` and `ReadFull` also works,
+but correctness then depends on six call sites remembering to participate, and
+on every future one doing the same. A missed site drops bytes silently: no
+error, no panic, just a wrong hash. The offset scheme has a single chokepoint
+that a new read path cannot bypass.
+
+### 9.6 Requirements
+
+- **Retention window.** Recorded bytes are kept only from the start of the
+  outermost active capture; everything earlier is discarded. Peak retention is
+  the size of the value being captured, and is subject to a limit of its own
+  (§7).
+- **Nesting is free.** Captures are `(start, end)` offset pairs into one
+  window, not a stack of buffers, so an inner capture is a sub-range of the
+  outer one and no byte can be counted twice.
+- **Off by default.** With no `RawMessage` in the destination, nothing is
+  recorded and nothing is retained.
+- **Single-reader invariant.** The correction in §9.5 holds only while the
+  decoder consumes exclusively through the one `bufio.Reader` it was
+  constructed with. Wrapping, replacing or reading around that reader breaks
+  capture. This invariant is part of the decoder's internal contract.
+- **Errors.** A capture interrupted by an error is abandoned; there is nothing
+  to unwind. Per §6 the failing error class decides whether the decoder
+  survives at all.
+
+### 9.7 Usage
 
 ```go
 type Torrent struct {
     Announce string     `bencode:"announce"`
     Info     RawMessage `bencode:"info"`
 }
+
+// infohash comes from the bytes, never from a re-encoding
+sum := sha1.Sum(t.Info)
+
+// the same bytes decode again on demand (§9.2.1)
+var info InfoDict
+err := NewDecoder(bytes.NewReader(t.Info)).Decode(&info)
 ```
 
-Why it is specified before it is needed: a torrent's infohash is
-`sha1(raw bytes of the info dict)`. It **cannot** be computed by re-encoding a
-decoded value — §2 leniency means key order and non-canonical encodings are not
-preserved. Capturing the span requires the read path to be able to tee bytes
-into a buffer, which is cheap to design in now and invasive to retrofit later.
-
-Requirements for the eventual implementation:
-
-- works at any nesting depth
-- nested captures nest correctly: an outer capture contains the inner one, and
-  a byte is never counted twice
-- capture is off by default and costs nothing when no `RawMessage` is in play
+Note the two-step: §3.3 makes the first field claiming a key the winner, so a
+struct cannot capture `info` raw *and* decode it into a typed field at the same
+time. Capture once, decode from the bytes.
 
 ---
 
