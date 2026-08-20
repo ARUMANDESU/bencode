@@ -19,10 +19,12 @@ const (
 var (
 	ErrUnsupportedType = errors.New("unsupported type")
 	ErrSyntax          = errors.New("syntax error")
-	ErrLeadingZero     = errors.New("leading zero")
-	ErrNegativeZero    = errors.New("negative zero")
-	ErrEmpty           = errors.New("empty")
-	ErrExceedsMax      = errors.New("exceeds max")
+
+	ErrLeadingZero  = fmt.Errorf("%w: leading zero", ErrSyntax)
+	ErrNegativeZero = fmt.Errorf("%w: negative zero", ErrSyntax)
+	ErrEmpty        = fmt.Errorf("%w: empty", ErrSyntax)
+
+	ErrExceedsMax = errors.New("exceeds max")
 
 	ErrTypeMismatch = errors.New("type mismatch")
 	// ErrOverflow: the value parsed, but does not fit the destination's width.
@@ -61,7 +63,7 @@ func NewDecoder(r io.Reader) *Decoder {
 
 func (d *Decoder) Decode(a any) error {
 	v := reflect.ValueOf(a)
-	if v.Kind() != reflect.Pointer {
+	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return ErrInvalidDestination
 	}
 	return d.decode(v.Elem())
@@ -72,6 +74,11 @@ func (d *Decoder) decode(v reflect.Value) error {
 	defer func() { d.depth-- }()
 	if d.depth >= MaxRecurtionDepth {
 		return ErrMaxDepth
+	}
+
+	v = indirect(v)
+	if v.Kind() == reflect.Interface && v.Type().NumMethod() != 0 {
+		return ErrTypeMismatch
 	}
 
 	if v.Type() == rawMessageType {
@@ -85,6 +92,9 @@ func (d *Decoder) decode(v reflect.Value) error {
 
 	b, err := d.br.ReadByte()
 	if err != nil {
+		if errors.Is(err, io.EOF) && d.depth > 1 {
+			return io.ErrUnexpectedEOF
+		}
 		return err
 	}
 
@@ -105,23 +115,14 @@ func (d *Decoder) decode(v reflect.Value) error {
 func (d *Decoder) decodeDict(v reflect.Value) error {
 	switch k := v.Kind(); k {
 	case reflect.Struct:
-		t := v.Type()
-		tags := make(map[string]reflect.Value, t.NumField())
-		for i := 0; i < t.NumField(); i++ {
-			field := t.Field(i)
-			tag := field.Tag.Get(tagName)
-			if len(tag) == 0 {
-				tag = field.Name
-			}
-			if tag == "-" || !field.IsExported() {
-				continue
-			}
-			tags[tag] = v.Field(i)
-		}
+		tags := d.buildTagsMap(v)
 
 		for {
 			db, err := d.br.ReadByte()
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return io.ErrUnexpectedEOF
+				}
 				return err
 			}
 			if db == 'e' {
@@ -150,7 +151,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				continue
 			}
 
-			if err := d.decode(fieldDst); err != nil {
+			if err := d.decode(fieldDst.value); err != nil {
 				return err
 			}
 		}
@@ -160,9 +161,16 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 			t = reflect.TypeFor[map[string]any]()
 		}
 		m := reflect.MakeMap(t)
+		if t.Key().Kind() != reflect.String {
+			return ErrTypeMismatch
+		}
+
 		for {
 			db, err := d.br.ReadByte()
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return io.ErrUnexpectedEOF
+				}
 				return err
 			}
 			if db == 'e' {
@@ -204,6 +212,51 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 
 	return nil
 }
+
+type TagValue struct {
+	value          reflect.Value
+	isNameFieldTag bool
+}
+
+func (d *Decoder) buildTagsMap(v reflect.Value) map[string]TagValue {
+	t := v.Type()
+
+	dup := make(map[string]struct{})
+	tags := make(map[string]TagValue, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() && !field.Anonymous {
+			continue
+		}
+		tag, ok := getTag(field.Tag.Get(tagName))
+		if !ok && len(tag) == 0 {
+			continue
+		}
+		tv := TagValue{value: v.Field(i)}
+		if ok && len(tag) == 0 {
+			tag = field.Name
+			tv.isNameFieldTag = true
+		}
+		existingTv, ok := tags[tag]
+		if ok {
+			if existingTv.isNameFieldTag && !tv.isNameFieldTag {
+			} else if (existingTv.isNameFieldTag && tv.isNameFieldTag) || (!existingTv.isNameFieldTag && !tv.isNameFieldTag) {
+				dup[tag] = struct{}{}
+			} else if !existingTv.isNameFieldTag && tv.isNameFieldTag {
+				continue
+			}
+		}
+		if _, ok := dup[tag]; ok {
+			delete(tags, tag)
+			continue
+		}
+
+		tags[tag] = tv
+	}
+
+	return tags
+}
+
 func (d *Decoder) decodeList(v reflect.Value) error {
 	if !v.CanSet() {
 		return ErrInvalidDestination
@@ -220,6 +273,9 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 		for {
 			lb, err := d.br.ReadByte()
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return io.ErrUnexpectedEOF
+				}
 				return err
 			}
 			if lb == 'e' {
@@ -248,6 +304,9 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 		for {
 			lb, err := d.br.ReadByte()
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return io.ErrUnexpectedEOF
+				}
 				return err
 			}
 			if lb == 'e' {
@@ -333,6 +392,10 @@ func (d *Decoder) decodeInt(v reflect.Value) error {
 			return ErrOverflow
 		}
 		v.Set(reflect.ValueOf(int64(iInt)))
+	case reflect.Bool:
+		if iStr != "0" {
+			v.SetBool(true)
+		}
 	default:
 		return ErrTypeMismatch
 	}
@@ -356,21 +419,24 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 	str := make([]byte, lengthInt)
 	_, err = io.ReadFull(d.br, str)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return io.ErrUnexpectedEOF
+		}
 		return err
 	}
 
-	switch k := v.Kind(); k {
-	case reflect.String:
+	switch k := v.Kind(); {
+	case k == reflect.String:
 		v.SetString(string(str))
-	case reflect.Slice:
+	case k == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
 		v.SetBytes(str)
-	case reflect.Array:
+	case k == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8:
 		if v.Len() != len(str) {
 			return ErrTypeMismatch
 		}
 
-		v.SetBytes(str)
-	case reflect.Interface:
+		reflect.Copy(v, reflect.ValueOf(str))
+	case k == reflect.Interface:
 		v.Set(reflect.ValueOf(string(str)))
 	default:
 		return ErrTypeMismatch
@@ -539,4 +605,70 @@ func (d *Decoder) readInt() (string, error) {
 
 func (d *Decoder) readRawValue() ([]byte, error) {
 	return nil, nil
+}
+
+func getTag(tag string) (string, bool) {
+	if len(tag) == 0 {
+		return "", true
+	}
+	opts := splitTag(tag)
+	if opts[0] == "-" && len(tag) == 1 {
+		return "", false
+	}
+	return opts[0], true
+}
+
+func splitTag(tag string) []string {
+	if len(tag) == 0 {
+		return nil
+	}
+
+	c := count(tag, ',')
+	if c == 0 {
+		return []string{tag}
+	}
+
+	s := make([]string, 0, c)
+	var n, m int
+	for n <= len(tag) {
+		if n == len(tag) || tag[n] == ',' {
+			s = append(s, tag[m:n])
+			m = n + 1
+		}
+
+		n++
+	}
+	return s
+}
+
+func count(s string, ch byte) int {
+	if len(s) == 0 || ch == 0 {
+		return 0
+	}
+
+	count := 0
+	for n := 0; n < len(s); n++ {
+		if s[n] == ch {
+			count++
+		}
+	}
+
+	return count
+}
+
+func indirect(v reflect.Value) reflect.Value {
+	for {
+		switch v.Kind() {
+		case reflect.Pointer:
+			if v.IsNil() {
+				if !v.CanSet() {
+					return v
+				}
+				v.Set(reflect.New(v.Type().Elem()))
+			}
+			v = v.Elem()
+		default:
+			return v
+		}
+	}
 }

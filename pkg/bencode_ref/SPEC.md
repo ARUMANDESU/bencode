@@ -94,9 +94,33 @@ an encoder concern; it is accepted in the tag so struct definitions can be
 shared with a future encoder, and it has no effect on decoding. Unknown options
 are ignored silently.
 
-If two fields resolve to the same key, the one declared **first** wins; later
-ones are never populated. This is a programming error the decoder does not
-report.
+#### Competing fields
+
+When two fields resolve to the same key, the winner is decided by these rules,
+in order — never by declaration order:
+
+1. A **tagged** field beats an untagged one. Given `A string` tagged `"B"`
+   alongside an untagged field `B`, the key `B` binds to `A`. This collision is
+   easy to create by accident now that untagged fields fall back to their Go
+   name, so it is worth resolving rather than reporting.
+2. Otherwise the key is **ambiguous and binds to nothing**. Neither field is
+   populated; the key is skipped exactly as an unknown key is.
+
+This follows `encoding/json`'s `dominantField`, minus its first rule
+(shallower embedding depth wins), which cannot apply here because embedded
+fields are not flattened — every field sits at depth 0. Add that rule first if
+flattening is ever adopted.
+
+Picking a winner by position was rejected. Go resolves ambiguity by declaration
+order nowhere: two embedded structs exposing the same field make the selector a
+*compile error*. Order-based rules also fail quietly in the direction people
+actually hit — under last-wins, appending a field silently steals a key from
+one above it, and the older field just goes dark. An ambiguous key that binds
+to nothing is order-independent, so reordering fields can never change
+behaviour, and a permanently zero field is easier to notice than a silently
+rebound one.
+
+An ambiguous key is a programming error the decoder does not report.
 
 Anonymous (embedded) struct fields are treated as ordinary fields — matched by
 type name or tag, **not** flattened into the parent.
@@ -208,7 +232,7 @@ Callers classify on `ErrSyntax`; tests may assert the specific one.
 | stream ends part-way through a value | `io.ErrUnexpectedEOF` |
 
 `io.EOF` is the only non-error error: it means "no more values", not "broken
-input". Every truncation case (`i42`, `4spam`, `10:abc`, `l`, `li1e`, `d`,
+input". Every truncation case (`i42`, `4`, `10:abc`, `l`, `li1e`, `d`,
 `d3:foo`) is `io.ErrUnexpectedEOF`.
 
 ---

@@ -62,16 +62,50 @@ type tagged struct {
 	unexported string `bencode:"unexported"`
 }
 
-// firstWins pins SPEC §3.3: two fields resolving to the same key is a
-// programming error the decoder does not report; the first declared wins.
-type firstWins struct {
+// ambiguous pins SPEC §3.3: two tagged fields claiming one key bind to
+// nothing. Declaration order must not decide.
+type ambiguous struct {
 	A string `bencode:"dup"`
 	B string `bencode:"dup"`
+}
+
+// taggedBeatsUntagged pins the one collision SPEC §3.3 does resolve. The two
+// types differ only in declaration order, which must not matter.
+type taggedBeatsUntagged struct {
+	A string `bencode:"B"`
+	B string
+}
+
+type untaggedBeforeTagged struct {
+	B string
+	A string `bencode:"B"`
+}
+
+// ambiguousThree and ambiguousMixed catch a resolver that decides pairwise
+// against the map it is building: once a contested key is removed, a third
+// claimant finds a clean miss and installs itself. Ambiguity has to be sticky.
+type ambiguousThree struct {
+	A string `bencode:"dup"`
+	B string `bencode:"dup"`
+	C string `bencode:"dup"`
+}
+
+// The tag is capitalised so it matches Dup's field name verbatim; §3.3 folds
+// no case, so a lowercase tag here would be a different key entirely and no
+// collision would occur.
+type ambiguousMixed struct {
+	A   string `bencode:"Dup"`
+	B   string `bencode:"Dup"`
+	Dup string
 }
 
 type caseSensitive struct {
 	IP string
 }
+
+// namedKey is string-kinded but not string-typed, which is the difference
+// between Kind() and Type() when guarding SetMapIndex.
+type namedKey string
 
 type sha struct {
 	Hash [20]byte `bencode:"hash"`
@@ -476,14 +510,64 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 		})
 	})
 
-	t.Run("two fields claiming one key: first declared wins", func(t *testing.T) {
+	// SPEC §3.3: an ambiguous key binds to nothing, the way encoding/json
+	// drops a name two same-depth fields both claim. Declaration order must
+	// not decide, so neither field may be populated.
+	t.Run("two tagged fields claiming one key: neither wins", func(t *testing.T) {
 		t.Parallel()
-		var got firstWins
+		var got ambiguous
 		require.NoError(t, decode(t, mustEncode(t, bencodeast.Dict{
 			"dup": bencodeast.Str("v"),
 		}), &got))
-		assert.Equal(t, "v", got.A)
-		assert.Equal(t, "", got.B)
+		assert.Equal(t, "", got.A)
+		assert.Equal(t, "", got.B, "an ambiguous key is skipped, not assigned by position")
+	})
+
+	t.Run("ambiguity is sticky", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("three tagged claimants", func(t *testing.T) {
+			t.Parallel()
+			var got ambiguousThree
+			require.NoError(t, decode(t, mustEncode(t, bencodeast.Dict{
+				"dup": bencodeast.Str("v"),
+			}), &got))
+			assert.Equal(t, ambiguousThree{}, got,
+				"a third claimant must not inherit a key two others already spoiled")
+		})
+
+		t.Run("two tagged claimants then an untagged one", func(t *testing.T) {
+			t.Parallel()
+			var got ambiguousMixed
+			require.NoError(t, decode(t, mustEncode(t, bencodeast.Dict{
+				"Dup": bencodeast.Str("w"),
+			}), &got))
+			assert.Equal(t, ambiguousMixed{}, got,
+				"an untagged claimant must not inherit a key two tagged ones already spoiled")
+		})
+	})
+
+	// SPEC §3.3 rule 1: the one collision that does resolve. Both orderings
+	// must give the same answer.
+	t.Run("a tagged field beats an untagged one claiming the same key", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{"B": bencodeast.Str("v")})
+
+		t.Run("tagged declared first", func(t *testing.T) {
+			t.Parallel()
+			var got taggedBeatsUntagged
+			require.NoError(t, decode(t, input, &got))
+			assert.Equal(t, "v", got.A)
+			assert.Equal(t, "", got.B)
+		})
+
+		t.Run("tagged declared last", func(t *testing.T) {
+			t.Parallel()
+			var got untaggedBeforeTagged
+			require.NoError(t, decode(t, input, &got))
+			assert.Equal(t, "v", got.A)
+			assert.Equal(t, "", got.B)
+		})
 	})
 
 	t.Run("omitempty is accepted and has no decoding effect", func(t *testing.T) {
@@ -1013,6 +1097,7 @@ func TestSpec5_Syntax(t *testing.T) {
 		{"int lone minus", "i-e"},
 		{"int trailing sign", "i4-e"},
 		{"string length not numeric", "4x:spam"},
+		{"string length with no colon at all", "4spam"},
 		{"string length negative", "-1:x"},
 		{"dict value is a terminator", "d3:fooe"},
 		// bencode dict keys are byte strings by spec, so this is malformed
@@ -1126,7 +1211,10 @@ func TestSpec5_2_EOF(t *testing.T) {
 	}{
 		{"int missing terminator", "i42"},
 		{"int missing everything", "i"},
-		{"string missing colon", "4spam"},
+		// Note "4spam" does NOT belong here: 's' is an invalid byte in a
+		// length prefix, which is a syntax error no matter how much data
+		// follows. A truncation is valid bytes that simply stop.
+		{"string length runs out", "4"},
 		{"string shorter than declared", "10:abc"},
 		{"string missing payload", "4:"},
 		{"list unterminated", "l"},
@@ -1483,6 +1571,13 @@ func TestSpec8_NeverPanics(t *testing.T) {
 		{"int", func() any { return new(int) }},
 		{"string", func() any { return new(string) }},
 		{"[4]byte", func() any { return new([4]byte) }},
+		// Same length as "spam", but reflect.Copy rejects arrays of a
+		// different element type — a length check alone does not make the
+		// copy legal.
+		{"[4]string", func() any { return new([4]string) }},
+		// Kind() is String but Type() is not string, so a plain
+		// AssignableTo on the key fails where a Convert would succeed.
+		{"map[namedKey]string", func() any { return new(map[namedKey]string) }},
 		{"map[int]string", func() any { return new(map[int]string) }},
 		{"map[string]int", func() any { return new(map[string]int) }},
 		{"map[bool]any", func() any { return new(map[bool]any) }},
@@ -1647,5 +1742,82 @@ func toAST(v any) (bencodeast.Value, bool) {
 		return d, true
 	default:
 		return nil, false
+	}
+}
+
+func TestGetTag(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		tag        string
+		expected   string
+		expectedOk bool
+	}{
+		{tag: "tag", expected: "tag", expectedOk: true},
+		{tag: "tag,", expected: "tag", expectedOk: true},
+		{tag: "-,", expected: "-", expectedOk: true},
+		{tag: "tag,opt1", expected: "tag", expectedOk: true},
+		{tag: ",opt1", expected: "", expectedOk: true},
+		{tag: "", expected: "", expectedOk: true},
+		{tag: "-", expected: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tag, func(t *testing.T) {
+			t.Parallel()
+			tag, ok := getTag(tt.tag)
+			require.Equal(t, tt.expected, tag)
+			assert.Equal(t, tt.expectedOk, ok)
+
+		})
+	}
+}
+
+func TestSplitTag(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		tag      string
+		expected []string
+	}{
+		{tag: "tag", expected: []string{"tag"}},
+		{tag: "tag,opt1", expected: []string{"tag", "opt1"}},
+		{tag: "tag,opt1,opt2", expected: []string{"tag", "opt1", "opt2"}},
+		{tag: "-", expected: []string{"-"}},
+		{tag: ",opt", expected: []string{"", "opt"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tag, func(t *testing.T) {
+			t.Parallel()
+			opts := splitTag(tt.tag)
+			require.Equal(t, tt.expected, opts)
+		})
+	}
+}
+
+func TestCount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		s        string
+		ch       byte
+		expected int
+	}{
+		{"test", 't', 2},
+		{"test", 'a', 0},
+		{"test", 'e', 1},
+		{"test,", ',', 1},
+		{"", ',', 0},
+		{"test", 0, 0},
+		{"test", 0, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.s, func(t *testing.T) {
+			t.Parallel()
+			c := count(tt.s, tt.ch)
+			require.Equal(t, tt.expected, c)
+		})
 	}
 }
