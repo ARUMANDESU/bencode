@@ -7,6 +7,7 @@ import (
 	"io"
 	"reflect"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -52,6 +53,7 @@ type discarder interface {
 type Decoder struct {
 	br    reader
 	depth uint
+	err   error
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -62,11 +64,15 @@ func NewDecoder(r io.Reader) *Decoder {
 }
 
 func (d *Decoder) Decode(a any) error {
+	if d.err != nil {
+		return d.err
+	}
+
 	v := reflect.ValueOf(a)
 	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return ErrInvalidDestination
 	}
-	return d.decode(v.Elem())
+	return d.error(d.decode(v.Elem()))
 }
 
 func (d *Decoder) decode(v reflect.Value) error {
@@ -74,6 +80,7 @@ func (d *Decoder) decode(v reflect.Value) error {
 	defer func() { d.depth-- }()
 	if d.depth >= MaxRecurtionDepth {
 		return ErrMaxDepth
+
 	}
 
 	v = indirect(v)
@@ -151,7 +158,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				continue
 			}
 
-			if err := d.decode(fieldDst.value); err != nil {
+			if err := d.decode(fieldDst); err != nil {
 				return err
 			}
 		}
@@ -195,7 +202,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				return err
 			}
 
-			m.SetMapIndex(reflect.ValueOf(key), fieldDst.Elem())
+			m.SetMapIndex(reflect.ValueOf(key).Convert(t.Key()), fieldDst.Elem())
 		}
 		v.Set(m)
 	default:
@@ -213,48 +220,62 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 	return nil
 }
 
-type TagValue struct {
-	value          reflect.Value
-	isNameFieldTag bool
+type tagFieldCandidate struct {
+	value      reflect.Value
+	isExplicit bool
 }
 
-func (d *Decoder) buildTagsMap(v reflect.Value) map[string]TagValue {
-	t := v.Type()
+func (d *Decoder) buildTagsMap(v reflect.Value) map[string]reflect.Value {
+	rt := v.Type()
+	candidates := make(map[string][]tagFieldCandidate, rt.NumField())
 
-	dup := make(map[string]struct{})
-	tags := make(map[string]TagValue, t.NumField())
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if !field.IsExported() && !field.Anonymous {
+	for i := 0; i < rt.NumField(); i++ {
+		field := rt.Field(i)
+		if !field.IsExported() {
 			continue
 		}
-		tag, ok := getTag(field.Tag.Get(tagName))
-		if !ok && len(tag) == 0 {
-			continue
-		}
-		tv := TagValue{value: v.Field(i)}
-		if ok && len(tag) == 0 {
-			tag = field.Name
-			tv.isNameFieldTag = true
-		}
-		existingTv, ok := tags[tag]
-		if ok {
-			if existingTv.isNameFieldTag && !tv.isNameFieldTag {
-			} else if (existingTv.isNameFieldTag && tv.isNameFieldTag) || (!existingTv.isNameFieldTag && !tv.isNameFieldTag) {
-				dup[tag] = struct{}{}
-			} else if !existingTv.isNameFieldTag && tv.isNameFieldTag {
+
+		name, isExplicit := field.Name, false
+		if raw, ok := field.Tag.Lookup(tagName); ok {
+			tag, _, hasOpts := strings.Cut(raw, ",")
+			if tag == "-" && !hasOpts {
 				continue
 			}
-		}
-		if _, ok := dup[tag]; ok {
-			delete(tags, tag)
-			continue
+			if tag != "" {
+				name, isExplicit = tag, true
+			}
 		}
 
-		tags[tag] = tv
+		candidates[name] = append(candidates[name], tagFieldCandidate{v.Field(i), isExplicit})
+	}
+
+	tags := make(map[string]reflect.Value, len(candidates))
+	for name, cs := range candidates {
+		if winner, ok := resolveTagCandidates(cs); ok {
+			tags[name] = winner
+		}
 	}
 
 	return tags
+}
+
+func resolveTagCandidates(cs []tagFieldCandidate) (reflect.Value, bool) {
+	if len(cs) == 1 {
+		return cs[0].value, true
+	}
+
+	var winner reflect.Value
+	explicit := 0
+	for _, c := range cs {
+		if c.isExplicit {
+			explicit++
+			winner = c.value
+		}
+	}
+	if explicit == 1 {
+		return winner, true
+	}
+	return reflect.Value{}, false
 }
 
 func (d *Decoder) decodeList(v reflect.Value) error {
@@ -393,9 +414,7 @@ func (d *Decoder) decodeInt(v reflect.Value) error {
 		}
 		v.Set(reflect.ValueOf(int64(iInt)))
 	case reflect.Bool:
-		if iStr != "0" {
-			v.SetBool(true)
-		}
+		v.SetBool(iStr != "0")
 	default:
 		return ErrTypeMismatch
 	}
@@ -591,9 +610,6 @@ func (d *Decoder) readInt() (string, error) {
 	}
 	bufLen := len(buf)
 
-	if bufLen == 0 {
-		return "", ErrEmpty
-	}
 	if buf[0] == '0' && bufLen > 1 {
 		return "", ErrLeadingZero
 	}
@@ -605,6 +621,13 @@ func (d *Decoder) readInt() (string, error) {
 
 func (d *Decoder) readRawValue() ([]byte, error) {
 	return nil, nil
+}
+
+func (d *Decoder) error(err error) error {
+	if !errors.Is(err, io.EOF) {
+		d.err = err
+	}
+	return err
 }
 
 func getTag(tag string) (string, bool) {
