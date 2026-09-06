@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -40,6 +41,8 @@ var (
 type RawMessage []byte
 
 var rawMessageType = reflect.TypeFor[RawMessage]()
+
+var fieldCache sync.Map
 
 type reader interface {
 	io.ByteScanner
@@ -120,36 +123,23 @@ func (d *Decoder) decode(v reflect.Value) error {
 }
 
 func (d *Decoder) decodeDict(v reflect.Value) error {
+	if !v.CanSet() {
+		return ErrInvalidDestination
+	}
 	switch k := v.Kind(); k {
 	case reflect.Struct:
-		tags := d.buildTagsMap(v)
+		fields := cachedFields(v.Type())
 
 		for {
-			db, err := d.br.ReadByte()
+			key, ok, err := d.readDictKey()
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					return io.ErrUnexpectedEOF
-				}
 				return err
 			}
-			if db == 'e' {
+			if !ok {
 				break
 			}
-			err = d.br.UnreadByte()
-			if err != nil {
-				return err
-			}
 
-			var key any
-			keyDst := reflect.ValueOf(&key).Elem()
-			if err := d.decode(keyDst); err != nil {
-				return err
-			}
-			if keyDst.Elem().Kind() != reflect.String {
-				return fmt.Errorf("%w: dict key must be string, not: %s", ErrSyntax, keyDst.Elem().Kind().String())
-			}
-
-			fieldDst, ok := tags[key.(string)]
+			idx, ok := fields[string(key)]
 			if !ok {
 				err = d.skipValue()
 				if err != nil {
@@ -158,7 +148,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				continue
 			}
 
-			if err := d.decode(fieldDst); err != nil {
+			if err := d.decode(v.Field(idx)); err != nil {
 				return err
 			}
 		}
@@ -167,34 +157,18 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 		if k == reflect.Interface {
 			t = reflect.TypeFor[map[string]any]()
 		}
-		m := reflect.MakeMap(t)
 		if t.Key().Kind() != reflect.String {
 			return ErrTypeMismatch
 		}
+		m := reflect.MakeMap(t)
 
 		for {
-			db, err := d.br.ReadByte()
+			key, ok, err := d.readDictKey()
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					return io.ErrUnexpectedEOF
-				}
 				return err
 			}
-			if db == 'e' {
+			if !ok {
 				break
-			}
-			err = d.br.UnreadByte()
-			if err != nil {
-				return err
-			}
-
-			var key any
-			keyDst := reflect.ValueOf(&key).Elem()
-			if err := d.decode(keyDst); err != nil {
-				return err
-			}
-			if keyDst.Elem().Kind() != reflect.String {
-				return fmt.Errorf("%w: dict key must be string, not: %s", ErrSyntax, keyDst.Elem().Kind().String())
 			}
 
 			fieldDst := reflect.New(t.Elem())
@@ -220,18 +194,25 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 	return nil
 }
 
-type tagFieldCandidate struct {
-	value      reflect.Value
+type fieldCandidate struct {
 	isExplicit bool
+	index      int
 }
 
-func (d *Decoder) buildTagsMap(v reflect.Value) map[string]reflect.Value {
-	rt := v.Type()
-	candidates := make(map[string][]tagFieldCandidate, rt.NumField())
+func cachedFields(t reflect.Type) map[string]int {
+	if f, ok := fieldCache.Load(t); ok {
+		return f.(map[string]int)
+	}
+	f, _ := fieldCache.LoadOrStore(t, buildFields(t))
+	return f.(map[string]int)
+}
 
-	for i := 0; i < rt.NumField(); i++ {
-		field := rt.Field(i)
-		if !field.IsExported() {
+func buildFields(t reflect.Type) map[string]int {
+	candidates := make(map[string][]fieldCandidate, t.NumField())
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() && !field.Anonymous {
 			continue
 		}
 
@@ -246,36 +227,36 @@ func (d *Decoder) buildTagsMap(v reflect.Value) map[string]reflect.Value {
 			}
 		}
 
-		candidates[name] = append(candidates[name], tagFieldCandidate{v.Field(i), isExplicit})
+		candidates[name] = append(candidates[name], fieldCandidate{isExplicit, i})
 	}
 
-	tags := make(map[string]reflect.Value, len(candidates))
+	fields := make(map[string]int, len(candidates))
 	for name, cs := range candidates {
-		if winner, ok := resolveTagCandidates(cs); ok {
-			tags[name] = winner
+		if winner, ok := resolveCandidates(cs); ok {
+			fields[name] = winner.index
 		}
 	}
 
-	return tags
+	return fields
 }
 
-func resolveTagCandidates(cs []tagFieldCandidate) (reflect.Value, bool) {
+func resolveCandidates(cs []fieldCandidate) (fieldCandidate, bool) {
 	if len(cs) == 1 {
-		return cs[0].value, true
+		return cs[0], true
 	}
 
-	var winner reflect.Value
+	var winner fieldCandidate
 	explicit := 0
 	for _, c := range cs {
 		if c.isExplicit {
 			explicit++
-			winner = c.value
+			winner = c
 		}
 	}
 	if explicit == 1 {
 		return winner, true
 	}
-	return reflect.Value{}, false
+	return fieldCandidate{}, false
 }
 
 func (d *Decoder) decodeList(v reflect.Value) error {
@@ -617,6 +598,41 @@ func (d *Decoder) readInt() (string, error) {
 		return "", ErrNegativeZero
 	}
 	return string(buf), nil
+}
+
+func (d *Decoder) readDictKey() ([]byte, bool, error) {
+	b, err := d.br.ReadByte()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, false, io.ErrUnexpectedEOF
+		}
+		return nil, false, err
+	}
+	if b == 'e' {
+		return nil, false, nil
+	}
+	if b < '0' || b > '9' {
+		return nil, false, fmt.Errorf("%w: dict key must be a string, got %q", ErrSyntax, b)
+	}
+	err = d.br.UnreadByte()
+	if err != nil {
+		return nil, false, err
+	}
+
+	n, err := d.readStrLen()
+	if err != nil {
+		return nil, false, err
+	}
+
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(d.br, buf); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, false, io.ErrUnexpectedEOF
+		}
+		return nil, false, err
+	}
+
+	return buf, true, nil
 }
 
 func (d *Decoder) readRawValue() ([]byte, error) {
