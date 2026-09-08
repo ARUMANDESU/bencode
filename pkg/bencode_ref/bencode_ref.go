@@ -110,6 +110,7 @@ type Decoder struct {
 	rec   *recorder
 	depth uint
 	err   error
+	off   int64 // snapshotted offset
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -128,7 +129,24 @@ func NewDecoder(r io.Reader) *Decoder {
 }
 
 func Unmarshal(b []byte, v any) error {
-	return NewDecoder(bytes.NewBuffer(b)).Decode(v)
+	d := NewDecoder(bytes.NewBuffer(b))
+	err := d.Decode(v)
+	if err != nil {
+		return err
+	}
+
+	buf, err := d.br.Peek(1)
+	if err == nil {
+		return &SyntaxError{
+			Offset: d.offset(),
+			msg:    fmt.Sprintf("trailing data after value, got: %q", buf[0]),
+			cause:  ErrSyntax,
+		}
+	}
+	if !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 func (d *Decoder) Decode(a any) error {
@@ -140,15 +158,18 @@ func (d *Decoder) Decode(a any) error {
 	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return ErrInvalidDestination
 	}
+
+	d.fixLimits()
 	return d.error(d.decode(v.Elem()))
 }
 
 func (d *Decoder) decode(v reflect.Value) error {
+	d.snapshotOffset()
 	d.depth++
 	defer func() { d.depth-- }()
-	if d.depth >= d.Limits.MaxDepth {
+	if d.depth > d.Limits.MaxDepth {
 		return &LimitError{
-			Offset: d.offset(),
+			Offset: d.off,
 			Limit:  "MaxDepth",
 			Value:  int64(d.Limits.MaxDepth),
 			cause:  ErrMaxDepth,
@@ -157,7 +178,7 @@ func (d *Decoder) decode(v reflect.Value) error {
 
 	v = indirect(v)
 	if v.Kind() == reflect.Interface && v.Type().NumMethod() != 0 {
-		return &TypeError{Offset: d.offset(), Type: v.Type(), cause: ErrTypeMismatch}
+		return &TypeError{Offset: d.off, Type: v.Type(), cause: ErrTypeMismatch}
 	}
 
 	if v.Type() == rawMessageType {
@@ -182,7 +203,11 @@ func (d *Decoder) decode(v reflect.Value) error {
 	case b >= '0' && b <= '9':
 		return d.decodeString(v)
 	default:
-		return fmt.Errorf("%w: unexpected %q", ErrSyntax, b)
+		return &SyntaxError{
+			Offset: d.off,
+			msg:    fmt.Sprintf("unexpected: %q", b),
+			cause:  ErrSyntax,
+		}
 	}
 }
 
@@ -190,7 +215,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 	t := v.Type()
 	if !v.CanSet() {
 		return &TypeError{
-			Offset: d.offset(),
+			Offset: d.off,
 			Value:  "dict",
 			Type:   t,
 			cause:  ErrInvalidDestination,
@@ -203,7 +228,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 		for {
 			key, ok, err := d.readDictKey()
 			if err != nil {
-				return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: err}
+				return &TypeError{Offset: d.off, Value: "dict", Type: t, cause: err}
 			}
 			if !ok {
 				break
@@ -219,14 +244,11 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 			}
 
 			if err := d.decode(v.Field(idx)); err != nil {
-				return &TypeError{
-					Offset: d.offset(),
-					Value:  "dict",
-					Type:   t,
-					cause:  err,
-					Struct: t.Name(),
-					Field:  v.Field(idx).Type().Name(),
+				if tErr, ok := errors.AsType[*TypeError](err); ok {
+					tErr.Struct = t.Name()
+					tErr.Field = t.Field(idx).Name
 				}
+				return err
 			}
 		}
 	case reflect.Map, reflect.Interface:
@@ -235,14 +257,14 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 			t = reflect.TypeFor[map[string]any]()
 		}
 		if t.Key().Kind() != reflect.String {
-			return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: ErrTypeMismatch}
+			return &TypeError{Offset: d.off, Value: "dict", Type: t, cause: ErrTypeMismatch}
 		}
 		m := reflect.MakeMap(t)
 
 		for {
 			key, ok, err := d.readDictKey()
 			if err != nil {
-				return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: err}
+				return &TypeError{Offset: d.off, Value: "dict", Type: t, cause: err}
 			}
 			if !ok {
 				break
@@ -250,14 +272,14 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 
 			fieldDst := reflect.New(t.Elem())
 			if err := d.decode(fieldDst.Elem()); err != nil {
-				return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: err}
+				return err
 			}
 
 			m.SetMapIndex(reflect.ValueOf(key).Convert(t.Key()), fieldDst.Elem())
 		}
 		v.Set(m)
 	default:
-		return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: ErrTypeMismatch}
+		return &TypeError{Offset: d.off, Value: "dict", Type: t, cause: ErrTypeMismatch}
 	}
 
 	return nil
@@ -331,7 +353,7 @@ func resolveCandidates(cs []fieldCandidate) (fieldCandidate, bool) {
 func (d *Decoder) decodeList(v reflect.Value) error {
 	t := v.Type()
 	if !v.CanSet() {
-		return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: ErrInvalidDestination}
+		return &TypeError{Offset: d.off, Value: "list", Type: t, cause: ErrInvalidDestination}
 	}
 	switch k := v.Kind(); k {
 	case reflect.Slice, reflect.Interface:
@@ -348,7 +370,7 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 				if errors.Is(err, io.EOF) {
 					err = io.ErrUnexpectedEOF
 				}
-				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
+				return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
 			}
 			if lb == 'e' {
 				break
@@ -356,13 +378,13 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 
 			err = d.br.UnreadByte()
 			if err != nil {
-				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
+				return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
 			}
 
 			elem := reflect.New(t.Elem())
 			err = d.decode(elem.Elem())
 			if err != nil {
-				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
+				return err
 			}
 
 			s = reflect.Append(s, elem.Elem())
@@ -379,19 +401,19 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 				if errors.Is(err, io.EOF) {
 					err = io.ErrUnexpectedEOF
 				}
-				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
+				return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
 			}
 			if lb == 'e' {
 				break
 			}
 			err = d.br.UnreadByte()
 			if err != nil {
-				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
+				return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
 			}
 			if i >= v.Len() {
 				err = d.skipValue()
 				if err != nil {
-					return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
+					return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
 				}
 				continue
 			}
@@ -399,7 +421,7 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 			elem := reflect.New(v.Type().Elem())
 			err = d.decode(elem.Elem())
 			if err != nil {
-				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
+				return err
 			}
 
 			s.Index(i).Set(elem.Elem())
@@ -408,59 +430,59 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 
 		v.Set(s)
 	default:
-		return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: ErrTypeMismatch}
+		return &TypeError{Offset: d.off, Value: "list", Type: t, cause: ErrTypeMismatch}
 	}
 	return nil
 }
 func (d *Decoder) decodeInt(v reflect.Value) error {
 	t := v.Type()
 	if !v.CanSet() {
-		return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrInvalidDestination}
+		return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrInvalidDestination}
 	}
 
 	iStr, err := d.readInt()
 	if err != nil {
-		return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: err}
+		return err
 	}
 
 	switch k := v.Kind(); k {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		iInt, err := strconv.ParseInt(iStr, 10, 64)
 		if err != nil {
-			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
+			return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		if v.OverflowInt(iInt) {
-			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
+			return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.SetInt(int64(iInt))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		iUint, err := strconv.ParseUint(iStr, 10, 64)
 		if err != nil {
-			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
+			return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		if v.OverflowUint(iUint) {
-			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
+			return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.SetUint(uint64(iUint))
 	case reflect.Float32, reflect.Float64:
 		iFloat, err := strconv.ParseFloat(iStr, 64)
 		if err != nil {
-			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
+			return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		if v.OverflowFloat(iFloat) {
-			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
+			return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.SetFloat(iFloat)
 	case reflect.Interface:
 		iInt, err := strconv.ParseInt(iStr, 10, 64)
 		if err != nil {
-			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
+			return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.Set(reflect.ValueOf(int64(iInt)))
 	case reflect.Bool:
 		v.SetBool(iStr != "0")
 	default:
-		return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrTypeMismatch}
+		return &TypeError{Offset: d.off, Value: "integer", Type: t, cause: ErrTypeMismatch}
 	}
 	return nil
 }
@@ -468,16 +490,26 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 	t := v.Type()
 	err := d.br.UnreadByte()
 	if err != nil {
-		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: err}
+		return &TypeError{Offset: d.off, Value: "string", Type: t, cause: err}
 	}
 
 	if !v.CanSet() {
-		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: ErrInvalidDestination}
+		return &TypeError{Offset: d.off, Value: "string", Type: t, cause: ErrInvalidDestination}
 	}
 
 	lengthInt, err := d.readStrLen()
 	if err != nil {
-		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: err}
+		return err
+	}
+
+	if int64(lengthInt) > d.Limits.MaxStringBytes {
+		err := &LimitError{
+			Offset: d.off,
+			Limit:  "MaxStringBytes",
+			Value:  int64(lengthInt),
+			cause:  ErrExceedsMax,
+		}
+		return &TypeError{Offset: d.off, Value: "string", Type: t, cause: err}
 	}
 
 	str := make([]byte, lengthInt)
@@ -486,7 +518,7 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 		if errors.Is(err, io.EOF) {
 			err = io.ErrUnexpectedEOF
 		}
-		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: err}
+		return &TypeError{Offset: d.off, Value: "string", Type: t, cause: err}
 	}
 
 	switch k := v.Kind(); {
@@ -496,25 +528,26 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 		v.SetBytes(str)
 	case k == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8:
 		if v.Len() != len(str) {
-			return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: ErrArrayLength}
+			return &TypeError{Offset: d.off, Value: "string", Type: t, cause: ErrArrayLength}
 		}
 
 		reflect.Copy(v, reflect.ValueOf(str))
 	case k == reflect.Interface:
 		v.Set(reflect.ValueOf(string(str)))
 	default:
-		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: ErrTypeMismatch}
+		return &TypeError{Offset: d.off, Value: "string", Type: t, cause: ErrTypeMismatch}
 	}
 
 	return nil
 }
 
 func (d *Decoder) skipValue() error {
+	d.snapshotOffset()
 	d.depth++
 	defer func() { d.depth-- }()
-	if d.depth >= DefaultMaxRecursionDepth {
+	if d.depth > d.Limits.MaxDepth {
 		return &LimitError{
-			Offset: d.offset(),
+			Offset: d.off,
 			Limit:  "MaxDepth",
 			Value:  int64(d.Limits.MaxDepth),
 			cause:  ErrMaxDepth,
@@ -611,14 +644,14 @@ func (d *Decoder) readIntSlice(delim byte) ([]byte, error) {
 		}
 		if (b < '0' || b > '9') && (b != '-' || n != 0) {
 			return nil, &SyntaxError{
-				Offset: d.offset(),
+				Offset: d.off,
 				msg:    fmt.Sprintf("must be digit or `-`, got: %q", b),
 				cause:  ErrSyntax,
 			}
 		}
 		if n > maxInt64Digits {
 			return nil, &SyntaxError{
-				Offset: d.offset(),
+				Offset: d.off,
 				msg:    fmt.Sprintf("integer can only hold %d digits", maxInt64Digits),
 				cause:  ErrExceedsMax,
 			}
@@ -627,10 +660,10 @@ func (d *Decoder) readIntSlice(delim byte) ([]byte, error) {
 		n++
 	}
 	if n == 0 {
-		return nil, &SyntaxError{Offset: d.offset(), msg: "can't be empty", cause: ErrEmpty}
+		return nil, &SyntaxError{Offset: d.off, msg: "can't be empty", cause: ErrEmpty}
 	}
 	if n == 1 && buf[0] == '-' {
-		return nil, &SyntaxError{Offset: d.offset(), msg: "no digits after '-'", cause: ErrSyntax}
+		return nil, &SyntaxError{Offset: d.off, msg: "no digits after '-'", cause: ErrSyntax}
 	}
 
 	return buf, nil
@@ -643,14 +676,14 @@ func (d *Decoder) readStrLen() (int, error) {
 	}
 	if buf[0] == '0' && len(buf) > 1 {
 		return 0, &SyntaxError{
-			Offset: d.offset(),
+			Offset: d.off,
 			msg:    "leading zero is forbidden",
 			cause:  ErrLeadingZero,
 		}
 	}
 	if buf[0] == '-' {
 		return 0, &SyntaxError{
-			Offset: d.offset(),
+			Offset: d.off,
 			msg:    "leading `-` is forbidden for string length",
 			cause:  ErrSyntax,
 		}
@@ -667,14 +700,14 @@ func (d *Decoder) readInt() (string, error) {
 
 	if buf[0] == '0' && bufLen > 1 {
 		return "", &SyntaxError{
-			Offset: d.offset(),
+			Offset: d.off,
 			msg:    "leading zero is forbidden",
 			cause:  ErrLeadingZero,
 		}
 	}
 	if buf[0] == '-' && bufLen > 1 && buf[1] == '0' {
 		return "", &SyntaxError{
-			Offset: d.offset(),
+			Offset: d.off,
 			msg:    "negavie zero is forbidden",
 			cause:  ErrNegativeZero,
 		}
@@ -683,6 +716,7 @@ func (d *Decoder) readInt() (string, error) {
 }
 
 func (d *Decoder) readDictKey() ([]byte, bool, error) {
+	d.snapshotOffset()
 	b, err := d.br.ReadByte()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -695,7 +729,7 @@ func (d *Decoder) readDictKey() ([]byte, bool, error) {
 	}
 	if b < '0' || b > '9' {
 		return nil, false, &SyntaxError{
-			Offset: d.offset(),
+			Offset: d.off,
 			msg:    fmt.Sprintf("dict key must be a string, got %q", b),
 			cause:  ErrSyntax,
 		}
@@ -734,6 +768,21 @@ func (d *Decoder) error(err error) error {
 	return err
 }
 
+func (d *Decoder) fixLimits() {
+	if d.Limits.MaxCaptureBytes == 0 {
+		d.Limits.MaxCaptureBytes = DefaultMaxCaptureBytes
+	}
+	if d.Limits.MaxDepth == 0 {
+		d.Limits.MaxDepth = DefaultMaxRecursionDepth
+	}
+	if d.Limits.MaxStringBytes == 0 {
+		d.Limits.MaxStringBytes = DefaultMaxStringBytes
+	}
+	if d.Limits.MaxValueBytes == 0 {
+		d.Limits.MaxValueBytes = DefaultMaxValueBytes
+	}
+}
+
 func (d *Decoder) decodeRawValue(v reflect.Value) error {
 	startOffset := d.offset()
 	d.startRecorder(startOffset)
@@ -742,12 +791,12 @@ func (d *Decoder) decodeRawValue(v reflect.Value) error {
 
 	err := d.skipValue()
 	if err != nil {
-		return &TypeError{Offset: d.offset(), Type: rawMessageType, cause: err}
+		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
 	}
 	endOffset := d.offset()
 	raw, err := d.rec.getBuf(startOffset, endOffset)
 	if err != nil {
-		return &TypeError{Offset: d.offset(), Type: rawMessageType, cause: err}
+		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
 	}
 	v.SetBytes(slices.Clone(raw))
 	return nil
@@ -756,6 +805,8 @@ func (d *Decoder) decodeRawValue(v reflect.Value) error {
 func (d *Decoder) offset() int64 {
 	return d.rec.pulled - int64(d.br.Buffered())
 }
+
+func (d *Decoder) snapshotOffset() { d.off = d.offset() }
 
 // startRecorder must be called only on a value boundary, before the first byte is read
 //
