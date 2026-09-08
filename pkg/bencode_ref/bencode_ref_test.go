@@ -2081,11 +2081,16 @@ func TestSpec7_Depth(t *testing.T) {
 func TestSpec7_2_BoundedScans(t *testing.T) {
 	t.Parallel()
 
-	// With tinyLimits the scan bounds are tens of bytes, so a few hundred
-	// bytes of junk is already far past every one of them. The assertion is
-	// that the decoder stops early — not where exactly it stops.
-	const junk = 4096
-	const allowed = 512
+	// With tinyLimits the scan bounds are tens of bytes, so this much junk is
+	// far past every one of them. The assertion is that the decoder stops
+	// early — not where exactly it stops.
+	//
+	// countingReader sees what bufio prefetched, not what the decoder
+	// consumed, so allowed has to clear bufio's own read granularity: junk is
+	// many buffers' worth, allowed is a couple of buffers. Reading to EOF and
+	// stopping at the bound are then far apart.
+	const junk = 64 << 10
+	const allowed = 8192
 
 	t.Run("integer with no terminator", func(t *testing.T) {
 		t.Parallel()
@@ -2223,7 +2228,10 @@ func TestSpec7_3_MaxValueBytes(t *testing.T) {
 
 		var got []int
 		require.Error(t, decodeWith(t, d, &got))
-		assert.Less(t, r.read, 4096,
+		// 8192, not 4096: countingReader sees bufio's prefetch, and one buffer
+		// fill is already 4096. The input is 15002 bytes, so stopping at the
+		// limit and reading to EOF stay far apart.
+		assert.Less(t, r.read, 8192,
 			"read %d bytes past a 256-byte value limit", r.read)
 	})
 

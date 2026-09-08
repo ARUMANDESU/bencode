@@ -15,9 +15,9 @@ import (
 
 const (
 	tagName                  = "bencode"
-	DefaultMaxStringBytes    = 7 << 20
-	DefaultMaxCaptureBytes   = 64 << 20
-	DefaultMaxValueBytes     = 64 << 20
+	DefaultMaxStringBytes    = 8 << 20
+	DefaultMaxCaptureBytes   = 8 << 20
+	DefaultMaxValueBytes     = 16 << 20
 	DefaultMaxRecursionDepth = 128
 )
 
@@ -106,11 +106,12 @@ type Limits struct {
 type Decoder struct {
 	Limits Limits
 
-	br    *bufio.Reader
-	rec   *recorder
-	depth uint
-	err   error
-	off   int64 // snapshotted offset
+	br       *bufio.Reader
+	rec      *recorder
+	depth    uint
+	err      error
+	off      int64 // snapshotted offset
+	startOff int64
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -160,11 +161,22 @@ func (d *Decoder) Decode(a any) error {
 	}
 
 	d.fixLimits()
+	d.startOff = d.offset()
 	return d.error(d.decode(v.Elem()))
 }
 
 func (d *Decoder) decode(v reflect.Value) error {
+	if d.offset()-d.startOff > d.Limits.MaxValueBytes {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxValueBytes",
+			Value:  d.Limits.MaxValueBytes,
+			cause:  ErrExceedsMax,
+		}
+	}
+
 	d.snapshotOffset()
+
 	d.depth++
 	defer func() { d.depth-- }()
 	if d.depth > d.Limits.MaxDepth {
@@ -501,7 +513,14 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 	if err != nil {
 		return err
 	}
-
+	if d.offset()-d.startOff+int64(lengthInt) > d.Limits.MaxValueBytes {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxValueBytes",
+			Value:  d.offset() + int64(lengthInt),
+			cause:  ErrExceedsMax,
+		}
+	}
 	if int64(lengthInt) > d.Limits.MaxStringBytes {
 		err := &LimitError{
 			Offset: d.off,
@@ -542,7 +561,17 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 }
 
 func (d *Decoder) skipValue() error {
+	if d.offset()-d.startOff > d.Limits.MaxValueBytes {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxValueBytes",
+			Value:  d.Limits.MaxValueBytes,
+			cause:  ErrExceedsMax,
+		}
+	}
+
 	d.snapshotOffset()
+
 	d.depth++
 	defer func() { d.depth-- }()
 	if d.depth > d.Limits.MaxDepth {
@@ -618,6 +647,14 @@ func (d *Decoder) skipString() error {
 	lengthInt, err := d.readStrLen()
 	if err != nil {
 		return err
+	}
+	if d.offset()-d.startOff+int64(lengthInt) > d.Limits.MaxValueBytes {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxValueBytes",
+			Value:  d.offset() + int64(lengthInt),
+			cause:  ErrExceedsMax,
+		}
 	}
 
 	_, err = d.br.Discard(lengthInt)
