@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	bencodeast "github.com/ARUMANDESU/gotorrent/pkg/bencode_ast"
@@ -17,13 +18,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file asserts SPEC.md and nothing else. Every test cites the section it
-// enforces. When a test and the implementation disagree, the spec decides which
-// one is wrong — a test that merely describes what the code happens to do today
-// is worthless, because it can never fail for a reason worth knowing.
+// This file asserts SPEC.md draft 2 and nothing else. Every test cites the
+// section it enforces. When a test and the implementation disagree, the spec
+// decides which one is wrong — a test that merely describes what the code
+// happens to do today is worthless, because it can never fail for a reason
+// worth knowing.
 //
-// Not covered here: SPEC §9 RawMessage, which is specified but deliberately not
-// implemented yet. Add its tests with the feature.
+// Not covered here: SPEC §9 RawMessage, which is specified but deliberately
+// not implemented yet. Add its tests with the feature.
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -62,14 +64,14 @@ type tagged struct {
 	unexported string `bencode:"unexported"`
 }
 
-// ambiguous pins SPEC §3.3: two tagged fields claiming one key bind to
+// ambiguous pins SPEC §3.3.1: two tagged fields claiming one key bind to
 // nothing. Declaration order must not decide.
 type ambiguous struct {
 	A string `bencode:"dup"`
 	B string `bencode:"dup"`
 }
 
-// taggedBeatsUntagged pins the one collision SPEC §3.3 does resolve. The two
+// taggedBeatsUntagged pins the one collision SPEC §3.3.1 does resolve. The two
 // types differ only in declaration order, which must not matter.
 type taggedBeatsUntagged struct {
 	A string `bencode:"B"`
@@ -99,6 +101,15 @@ type ambiguousMixed struct {
 	Dup string
 }
 
+// optsOnlyVsUntagged pins SPEC §3.3 rules 3 and 4 read together: a tag that
+// supplies no name does NOT make the field tagged for §3.3.1. Both fields here
+// are untagged claimants of "V", so the key is ambiguous. If `,omitempty`
+// counted as tagged, A would win and this test would fail.
+type optsOnlyVsUntagged struct {
+	A string `bencode:"V,omitempty"`
+	V string
+}
+
 type caseSensitive struct {
 	IP string
 }
@@ -107,12 +118,48 @@ type caseSensitive struct {
 // between Kind() and Type() when guarding SetMapIndex.
 type namedKey string
 
+// The embedded fixtures below split a case draft 1 conflated. SPEC §3.3 rule 1
+// skips every unexported field, and for an embedded field the field's name is
+// its type's name — so `simple` embedded is an UNEXPORTED field and must be
+// skipped, while `Exported` embedded must not be.
+type Exported struct {
+	S string `bencode:"s"`
+}
+
+type embedsExported struct {
+	Exported `bencode:"emb"`
+	Extra    string `bencode:"extra"`
+}
+
+type unexportedMap map[string]int
+
+type unexportedSlice []string
+
+type embedsUnexportedStruct struct {
+	simple
+	Extra string `bencode:"extra"`
+}
+
+type embedsUnexportedMap struct {
+	unexportedMap
+	Extra string `bencode:"extra"`
+}
+
+type embedsUnexportedSlice struct {
+	unexportedSlice
+	Extra string `bencode:"extra"`
+}
+
 type sha struct {
 	Hash [20]byte `bencode:"hash"`
 }
 
 type unsigned struct {
 	U uint64 `bencode:"u"`
+}
+
+type boolField struct {
+	B bool `bencode:"b"`
 }
 
 // ---------------------------------------------------------------------------
@@ -155,9 +202,30 @@ func decodeWith(t *testing.T, d *Decoder, dst any) error {
 	return d.Decode(dst)
 }
 
+// tinyLimits shrinks every bound in SPEC §7 to something a test can exceed in
+// a few dozen bytes. The properties being asserted are about behaviour AT the
+// boundary, never about where the boundary sits, so testing them at 8 MiB only
+// buys a slower suite and multi-megabyte fixtures.
+func tinyLimits() Limits {
+	return Limits{
+		MaxStringBytes:  64,
+		MaxValueBytes:   256,
+		MaxCaptureBytes: 64,
+		MaxDepth:        16,
+	}
+}
+
+// tinyDecoder is a Decoder over input with tinyLimits already applied.
+func tinyDecoder(input string) *Decoder {
+	d := NewDecoder(strings.NewReader(input))
+	d.Limits = tinyLimits()
+	return d
+}
+
 // countingReader reports how many bytes the decoder actually pulled, proving
 // it gives up on a hostile value instead of buffering the stream while it
-// hunts for a terminator (SPEC §7.2).
+// hunts for a terminator (SPEC §7.2), and that a poisoned decoder reads
+// nothing further (SPEC §6.1).
 type countingReader struct {
 	src  io.Reader
 	read int
@@ -170,6 +238,11 @@ func (c *countingReader) Read(p []byte) (int, error) {
 }
 
 // allocatedBytes reports how much fn allocated in total.
+//
+// This reads process-wide counters, so it is only meaningful while nothing
+// else in the binary is allocating. `go test` runs non-parallel tests to
+// completion before resuming parallel ones, which is what keeps this honest —
+// the caller must NOT call t.Parallel().
 func allocatedBytes(fn func()) uint64 {
 	var before, after runtime.MemStats
 	runtime.GC()
@@ -183,6 +256,48 @@ func repeat(s string, n int) string { return strings.Repeat(s, n) }
 
 // nest builds n levels of nested lists around an empty core.
 func nest(n int) string { return repeat("l", n) + repeat("e", n) }
+
+func truncateName(s string) string {
+	if len(s) > 24 {
+		return s[:24] + "..."
+	}
+	return s
+}
+
+// everyDestinationShape is the set of destinations that exercise every branch
+// of SPEC §4, including the ones whose reflect operations panic when
+// unguarded. Shared between the §8 table and the §8 fuzz target so the two can
+// never drift apart.
+var everyDestinationShape = []struct {
+	name string
+	new  func() any
+}{
+	{"any", func() any { return new(any) }},
+	{"int", func() any { return new(int) }},
+	{"int8", func() any { return new(int8) }},
+	{"uint64", func() any { return new(uint64) }},
+	{"float64", func() any { return new(float64) }},
+	{"bool", func() any { return new(bool) }},
+	{"string", func() any { return new(string) }},
+	{"[]byte", func() any { return new([]byte) }},
+	{"[4]byte", func() any { return new([4]byte) }},
+	// Same length as "spam", but reflect.Copy rejects arrays of a different
+	// element type — a length check alone does not make the copy legal.
+	{"[4]string", func() any { return new([4]string) }},
+	{"[]string", func() any { return new([]string) }},
+	// Kind() is String but Type() is not string, so a plain AssignableTo on
+	// the key fails where a Convert would succeed.
+	{"map[namedKey]string", func() any { return new(map[namedKey]string) }},
+	{"map[int]string", func() any { return new(map[int]string) }},
+	{"map[string]int", func() any { return new(map[string]int) }},
+	{"map[bool]any", func() any { return new(map[bool]any) }},
+	{"non-empty interface", func() any { return new(io.Reader) }},
+	{"chan", func() any { return new(chan int) }},
+	{"func", func() any { return new(func()) }},
+	{"struct", func() any { return new(simple) }},
+	{"pointer to struct", func() any { return new(*simple) }},
+	{"embedded unexported map", func() any { return new(embedsUnexportedMap) }},
+}
 
 // ---------------------------------------------------------------------------
 // SPEC §2 — accepted grammar, and the leniency rules
@@ -230,11 +345,17 @@ func TestSpec2_Strings(t *testing.T) {
 		assert.Equal(t, "", got)
 	})
 
-	t.Run("length zero into byte slice", func(t *testing.T) {
+	// SPEC §4 promises a non-nil empty slice for an empty LIST and says
+	// nothing about an empty string. Pinning it explicitly rather than with
+	// assert.Empty, which passes for nil too: the difference surfaces later in
+	// reflect.DeepEqual and in JSON round-trips, and "undecided" is not an
+	// answer a caller can code against.
+	t.Run("empty string into []byte yields a non-nil empty slice", func(t *testing.T) {
 		t.Parallel()
 		var got []byte
 		require.NoError(t, decode(t, "0:", &got))
-		assert.Empty(t, got)
+		assert.NotNil(t, got, "an empty bencode string is a value, not an absence")
+		assert.Len(t, got, 0)
 	})
 
 	t.Run("payload containing bencode metacharacters is not parsed", func(t *testing.T) {
@@ -252,7 +373,7 @@ func TestSpec2_Strings(t *testing.T) {
 	})
 }
 
-func TestSpec2_Leniency(t *testing.T) {
+func TestSpec2_1_Leniency(t *testing.T) {
 	t.Parallel()
 
 	t.Run("unsorted keys are accepted", func(t *testing.T) {
@@ -352,15 +473,17 @@ func TestSpec3_1_EntryPoint(t *testing.T) {
 		})
 	}
 
-	// SPEC §3.1: ErrInvalidDestination is reachable only from this check, and
-	// §6 requires it to consume nothing. A caller that passes a bad
-	// destination has not damaged the stream.
+	// SPEC §6.1: ErrInvalidDestination is the sole error that does not poison,
+	// because it is raised before the reader is touched. The caller's argument
+	// was bad; the stream is untouched.
 	t.Run("consumes no bytes and leaves the decoder usable", func(t *testing.T) {
 		t.Parallel()
-		d := NewDecoder(strings.NewReader("i42e"))
+		r := &countingReader{src: strings.NewReader("i42e")}
+		d := NewDecoder(r)
 
 		var bad int
 		require.ErrorIs(t, decodeWith(t, d, bad), ErrInvalidDestination)
+		assert.Zero(t, r.read, "a rejected destination must not have moved the stream")
 
 		var good int
 		require.NoError(t, decodeWith(t, d, &good))
@@ -426,6 +549,23 @@ func TestSpec3_2_Pointers(t *testing.T) {
 		assert.Nil(t, got.P)
 		assert.Nil(t, got.PP)
 		require.NotNil(t, got.PS)
+	})
+
+	// SPEC §3.2, second half: "present AND BOUND". An ambiguous key is present
+	// in the input and binds to nothing, so it must allocate nothing either.
+	t.Run("a present but ambiguous key allocates nothing", func(t *testing.T) {
+		t.Parallel()
+		type ambiguousPtr struct {
+			A *string `bencode:"dup"`
+			B *string `bencode:"dup"`
+		}
+
+		input := mustEncode(t, bencodeast.Dict{"dup": bencodeast.Str("v")})
+
+		var got ambiguousPtr
+		require.NoError(t, decode(t, input, &got))
+		assert.Nil(t, got.A)
+		assert.Nil(t, got.B)
 	})
 
 	t.Run("pointer elements inside a slice", func(t *testing.T) {
@@ -510,9 +650,9 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 		})
 	})
 
-	// SPEC §3.3: an ambiguous key binds to nothing, the way encoding/json
-	// drops a name two same-depth fields both claim. Declaration order must
-	// not decide, so neither field may be populated.
+	// SPEC §3.3.1 rule 2: an ambiguous key binds to nothing, the way
+	// encoding/json drops a name two same-depth fields both claim. Declaration
+	// order must not decide, so neither field may be populated.
 	t.Run("two tagged fields claiming one key: neither wins", func(t *testing.T) {
 		t.Parallel()
 		var got ambiguous
@@ -547,7 +687,7 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 		})
 	})
 
-	// SPEC §3.3 rule 1: the one collision that does resolve. Both orderings
+	// SPEC §3.3.1 rule 1: the one collision that does resolve. Both orderings
 	// must give the same answer.
 	t.Run("a tagged field beats an untagged one claiming the same key", func(t *testing.T) {
 		t.Parallel()
@@ -570,6 +710,19 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 		})
 	})
 
+	// SPEC §3.3 rules 3 and 4: only a tag that supplies a NAME makes a field
+	// tagged. `bencode:",omitempty"` supplies options and no name, so it is an
+	// untagged claimant and cannot win rule 1.
+	t.Run("an options-only tag does not make a field tagged", func(t *testing.T) {
+		t.Parallel()
+		var got optsOnlyVsUntagged
+		require.NoError(t, decode(t, mustEncode(t, bencodeast.Dict{
+			"V": bencodeast.Str("v"),
+		}), &got))
+		assert.Equal(t, optsOnlyVsUntagged{}, got,
+			"two untagged claimants are ambiguous; an options-only tag must not break the tie")
+	})
+
 	t.Run("omitempty is accepted and has no decoding effect", func(t *testing.T) {
 		t.Parallel()
 		// The key is absent, so omitempty has nothing to be tempted by; the
@@ -578,25 +731,79 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 		require.NoError(t, decode(t, "de", &got))
 		assert.Equal(t, "", got.OptsOnly)
 	})
+}
 
-	// SPEC §3.3: embedded fields are ordinary fields, not flattened.
-	t.Run("embedded struct is not flattened", func(t *testing.T) {
+// SPEC §3.3 rule 1 says "unexported → always skipped, INCLUDING embedded
+// fields", and §3.1 depends on it: admitting a read-only reflect.Value into
+// the decode path turns the internal CanSet assertions into reachable code and
+// panics in the container paths, which call Set on the whole value.
+//
+// An embedded field's name is its type's name, so `simple` embedded is an
+// unexported field. Draft 1 admitted it and appeared to work — but only for
+// struct-typed embeds, because reflect does not propagate flagEmbedRO to the
+// fields underneath. Map- and slice-typed embeds panic on the Set at the end
+// of their branch. That is one working shape out of four, not a feature.
+func TestSpec3_3_EmbeddedFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an exported embedded field is an ordinary field, not flattened", func(t *testing.T) {
 		t.Parallel()
-		type embedded struct {
-			simple `bencode:"emb"`
-			Extra  string `bencode:"extra"`
-		}
-
 		input := mustEncode(t, bencodeast.Dict{
 			"emb":   bencodeast.Dict{"s": bencodeast.Str("inner")},
 			"extra": bencodeast.Str("outer"),
 			"s":     bencodeast.Str("must not leak into the embedded field"),
 		})
 
-		var got embedded
+		var got embedsExported
 		require.NoError(t, decode(t, input, &got))
-		assert.Equal(t, "inner", got.simple.S)
+		assert.Equal(t, "inner", got.Exported.S)
 		assert.Equal(t, "outer", got.Extra)
+	})
+
+	// One subtest per underlying kind, because the failure mode differs: the
+	// struct case silently populates, the map and slice cases panic.
+	t.Run("unexported embedded fields are skipped for every underlying kind", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("struct", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{
+				"simple": bencodeast.Dict{"s": bencodeast.Str("must not bind")},
+				"extra":  bencodeast.Str("kept"),
+			})
+
+			var got embedsUnexportedStruct
+			require.NoError(t, decode(t, input, &got))
+			assert.Equal(t, simple{}, got.simple,
+				"the type name of an unexported embed is not a key")
+			assert.Equal(t, "kept", got.Extra, "the decoder must stay in sync while skipping it")
+		})
+
+		t.Run("map", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{
+				"unexportedMap": bencodeast.Dict{"k": bencodeast.Int(1)},
+				"extra":         bencodeast.Str("kept"),
+			})
+
+			var got embedsUnexportedMap
+			require.NoError(t, decode(t, input, &got))
+			assert.Nil(t, got.unexportedMap)
+			assert.Equal(t, "kept", got.Extra)
+		})
+
+		t.Run("slice", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{
+				"unexportedSlice": bencodeast.List{bencodeast.Str("a")},
+				"extra":           bencodeast.Str("kept"),
+			})
+
+			var got embedsUnexportedSlice
+			require.NoError(t, decode(t, input, &got))
+			assert.Nil(t, got.unexportedSlice)
+			assert.Equal(t, "kept", got.Extra)
+		})
 	})
 }
 
@@ -614,6 +821,17 @@ func TestSpec3_4_Reuse(t *testing.T) {
 		got := []string{"old"}
 		require.NoError(t, decode(t, input, &got))
 		assert.Equal(t, []string{"new"}, got)
+	})
+
+	// SPEC §3.4: an array is replaced wholesale and the tail is zeroed — a
+	// reused array must not show leftovers past the input's length.
+	t.Run("array tail is zeroed on reuse", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.List{bencodeast.Str("new")})
+
+		got := [3]string{"old1", "old2", "old3"}
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, [3]string{"new", "", ""}, got)
 	})
 
 	t.Run("map is replaced not merged", func(t *testing.T) {
@@ -674,7 +892,7 @@ func TestSpec4_IntegerDestinations(t *testing.T) {
 	})
 
 	// SPEC §4: i0e is false, any other integer is true. Consistent with the
-	// lenient stance in §2; listed in §10 as still open.
+	// lenient stance in §2.1; listed in §11 as still open.
 	t.Run("bool", func(t *testing.T) {
 		t.Parallel()
 		tests := []struct {
@@ -694,6 +912,31 @@ func TestSpec4_IntegerDestinations(t *testing.T) {
 				assert.Equal(t, tt.want, got)
 			})
 		}
+	})
+
+	// SPEC §4: "the destination is ALWAYS assigned, never left as it was".
+	// The natural implementation — `if v != 0 { SetBool(true) }` — passes
+	// every test above and fails this one, which is exactly why it is here.
+	// Destinations get reused (§3.4), and a false that cannot overwrite a true
+	// is a stale value with no way to detect it.
+	t.Run("i0e clears a destination that was already true", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("top level", func(t *testing.T) {
+			t.Parallel()
+			got := true
+			require.NoError(t, decode(t, "i0e", &got))
+			assert.False(t, got)
+		})
+
+		t.Run("struct field", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{"b": bencodeast.Int(0)})
+
+			got := boolField{B: true}
+			require.NoError(t, decode(t, input, &got))
+			assert.False(t, got.B)
+		})
 	})
 }
 
@@ -731,6 +974,10 @@ func TestSpec4_StringDestinations(t *testing.T) {
 		assert.Equal(t, []byte(hash), got.Hash[:])
 	})
 
+	// SPEC §4.1: strings into arrays are strict where lists into arrays
+	// truncate, because an array destination for a string is almost always a
+	// fixed-width identifier. A partially filled SHA-1 is not a degraded
+	// hash — it is a different hash that compares unequal far from its cause.
 	t.Run("length must equal the array exactly", func(t *testing.T) {
 		t.Parallel()
 
@@ -739,7 +986,8 @@ func TestSpec4_StringDestinations(t *testing.T) {
 			var got [20]byte
 			err := decode(t, "4:spam", &got)
 			require.Error(t, err)
-			assert.ErrorIs(t, err, ErrTypeMismatch)
+			assert.ErrorIs(t, err, ErrArrayLength, "the type matched; only the length did not")
+			assert.ErrorIs(t, err, ErrTypeMismatch, "must still classify as a mismatch")
 			assert.Equal(t, [20]byte{}, got, "a rejected value must not have been written")
 		})
 
@@ -748,6 +996,7 @@ func TestSpec4_StringDestinations(t *testing.T) {
 			var got [4]byte
 			err := decode(t, "8:spamspam", &got)
 			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrArrayLength)
 			assert.ErrorIs(t, err, ErrTypeMismatch)
 		})
 	})
@@ -816,6 +1065,9 @@ func TestSpec4_ListDestinations(t *testing.T) {
 		assert.Equal(t, [3]string{"a", "b", ""}, got)
 	})
 
+	// SPEC §4.1: an array destination for a LIST is a capacity choice —
+	// "give me at most N" — so surplus is discarded, not rejected. It must
+	// still be consumed, or the next Decode reads the leftovers.
 	t.Run("surplus elements are consumed and discarded", func(t *testing.T) {
 		t.Parallel()
 		d := NewDecoder(strings.NewReader("l1:a1:b1:cei99e"))
@@ -843,6 +1095,33 @@ func TestSpec4_DictDestinations(t *testing.T) {
 		var got map[string]string
 		require.NoError(t, decode(t, input, &got))
 		assert.Equal(t, map[string]string{"cow": "moo", "spam": "eggs"}, got)
+	})
+
+	// SPEC §4: string-KINDED keys are supported, including named string types.
+	// This is the combination that panics in SetMapIndex without an explicit
+	// Convert — §8 lists it as a standing panic source, and this test is the
+	// positive half: it must not merely avoid panicking, it must work.
+	t.Run("named string key type", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{
+			"cow": bencodeast.Str("moo"), "spam": bencodeast.Str("eggs"),
+		})
+
+		var got map[namedKey]string
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, map[namedKey]string{"cow": "moo", "spam": "eggs"}, got)
+	})
+
+	t.Run("named string key type inside a struct field", func(t *testing.T) {
+		t.Parallel()
+		type namedKeyField struct {
+			M map[namedKey]int `bencode:"m"`
+		}
+		input := mustEncode(t, bencodeast.Dict{"m": bencodeast.Dict{"k": bencodeast.Int(1)}})
+
+		var got namedKeyField
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, map[namedKey]int{"k": 1}, got.M)
 	})
 
 	t.Run("empty dict yields a non-nil empty map", func(t *testing.T) {
@@ -1013,6 +1292,7 @@ func TestSpec4_DestinationMatrix(t *testing.T) {
 			{"bool", func() any { return new(bool) }, ErrTypeMismatch},
 			{"float64", func() any { return new(float64) }, ErrTypeMismatch},
 			{"[]string", func() any { return new([]string) }, ErrTypeMismatch},
+			{"[20]byte", func() any { return new([20]byte) }, ErrArrayLength},
 			{"map", func() any { return new(map[string]string) }, ErrTypeMismatch},
 			{"struct", func() any { return new(simple) }, ErrTypeMismatch},
 			{"non-empty interface", func() any { return new(io.Reader) }, ErrTypeMismatch},
@@ -1033,6 +1313,7 @@ func TestSpec4_DestinationMatrix(t *testing.T) {
 
 		{"dict", aDict, []dstCase{
 			{"map[string]string", func() any { return new(map[string]string) }, nil},
+			{"map[namedKey]string", func() any { return new(map[namedKey]string) }, nil},
 			{"struct", func() any { return new(simple) }, nil},
 			{"any", func() any { return new(any) }, nil},
 			{"*struct", func() any { return new(*simple) }, nil},
@@ -1041,8 +1322,8 @@ func TestSpec4_DestinationMatrix(t *testing.T) {
 			{"[]string", func() any { return new([]string) }, ErrTypeMismatch},
 			{"[2]string", func() any { return new([2]string) }, ErrTypeMismatch},
 			{"non-empty interface", func() any { return new(io.Reader) }, ErrTypeMismatch},
-			// SPEC §4 + §8: rejected before any entry is decoded, and never a
-			// panic from SetMapIndex.
+			// SPEC §4 + §8: rejected before the map is allocated and before
+			// any entry is decoded, and never a panic from SetMapIndex.
 			{"map[int]string", func() any { return new(map[int]string) }, ErrTypeMismatch},
 		}},
 	}
@@ -1117,7 +1398,7 @@ func TestSpec5_Syntax(t *testing.T) {
 	}
 }
 
-// SPEC §5.1: the specific sentinels say how the bytes were malformed and wrap
+// SPEC §5.1: the sub-sentinels say how the bytes were malformed and wrap
 // ErrSyntax, so callers can classify on one axis while tests stay precise.
 func TestSpec5_1_SubSentinels(t *testing.T) {
 	t.Parallel()
@@ -1145,6 +1426,19 @@ func TestSpec5_1_SubSentinels(t *testing.T) {
 			assert.ErrorIs(t, err, ErrSyntax, "must also classify as a syntax error")
 		})
 	}
+
+	// ErrArrayLength is the one sub-sentinel that hangs off ErrTypeMismatch
+	// rather than ErrSyntax: the bytes were fine, the type was fine, only the
+	// width was wrong.
+	t.Run("array length wraps ErrTypeMismatch", func(t *testing.T) {
+		t.Parallel()
+		var got [20]byte
+		err := decode(t, "4:spam", &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrArrayLength)
+		assert.ErrorIs(t, err, ErrTypeMismatch)
+		assert.NotErrorIs(t, err, ErrSyntax, "well-formed bytes are not a syntax error")
+	})
 }
 
 func TestSpec5_Overflow(t *testing.T) {
@@ -1183,9 +1477,174 @@ func TestSpec5_Overflow(t *testing.T) {
 	})
 }
 
-// SPEC §5.2: io.EOF means "no more values"; io.ErrUnexpectedEOF means "broken
+// SPEC §5.2 — structured errors.
+//
+// Sentinels classify; they do not locate. "syntax error: unexpected 'x'" with
+// no position sends the caller hexdumping the whole file. These tests pin the
+// offsets, which is also the cheapest standing check on the consumed-offset
+// counter of §9.4 — the same counter RawMessage capture and MaxValueBytes both
+// depend on.
+func TestSpec5_2_StructuredErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("SyntaxError carries the offset of the offending byte", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			in   string
+			want int64
+		}{
+			{"first byte", "x", 0},
+			// SPEC §2: a non-string dict key is detected from the FIRST byte
+			// of the key. An offset past the integer would mean the decoder
+			// parsed the key before noticing it could not be one.
+			{"non-string dict key", "di1ei2ee", 1},
+			{"inside a list", "l4:spamxe", 7},
+			{"inside a dict value", "d1:sxe", 4},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				var got any
+				err := decode(t, tt.in, &got)
+				require.Error(t, err)
+
+				var se *SyntaxError
+				require.ErrorAs(t, err, &se)
+				assert.Equal(t, tt.want, se.Offset)
+				assert.ErrorIs(t, se, ErrSyntax)
+			})
+		}
+	})
+
+	// SPEC §5.2: offsets count from the first byte the Decoder ever read, not
+	// from the start of the current value. Anything else is useless for
+	// locating a fault in a stream.
+	t.Run("offsets are stream-global, not per-value", func(t *testing.T) {
+		t.Parallel()
+		d := NewDecoder(strings.NewReader("i42ex"))
+
+		var first int
+		require.NoError(t, decodeWith(t, d, &first))
+
+		var second any
+		err := decodeWith(t, d, &second)
+		require.Error(t, err)
+
+		var se *SyntaxError
+		require.ErrorAs(t, err, &se)
+		assert.Equal(t, int64(4), se.Offset,
+			"the bad byte is at stream offset 4, not offset 0 of the second value")
+	})
+
+	t.Run("TypeError carries the value kind, destination and offset", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("top level", func(t *testing.T) {
+			t.Parallel()
+			var got string
+			err := decode(t, "i1e", &got)
+			require.Error(t, err)
+
+			var te *TypeError
+			require.ErrorAs(t, err, &te)
+			assert.Equal(t, int64(0), te.Offset)
+			assert.Equal(t, "integer", te.Value)
+			assert.Equal(t, reflect.TypeFor[string](), te.Type)
+			assert.ErrorIs(t, te, ErrTypeMismatch)
+		})
+
+		t.Run("offset points at the start of the offending value", func(t *testing.T) {
+			t.Parallel()
+			// d 1 : s l 1 : a e e
+			// 0 1 2 3 4 5 6 7 8 9   — the list begins at 4.
+			var got simple
+			err := decode(t, "d1:sl1:aee", &got)
+			require.Error(t, err)
+
+			var te *TypeError
+			require.ErrorAs(t, err, &te)
+			assert.Equal(t, int64(4), te.Offset)
+			assert.Equal(t, "list", te.Value)
+			assert.Equal(t, reflect.TypeFor[string](), te.Type)
+		})
+
+		// SPEC §11 lists Struct/Field as an open decision. If they are dropped
+		// from TypeError, delete this subtest with them — do not weaken it to
+		// "may or may not be set", which asserts nothing.
+		t.Run("struct and field name when reached through a struct", func(t *testing.T) {
+			t.Parallel()
+			var got simple
+			err := decode(t, "d1:sl1:aee", &got)
+			require.Error(t, err)
+
+			var te *TypeError
+			require.ErrorAs(t, err, &te)
+			assert.Equal(t, "simple", te.Struct)
+			assert.Equal(t, "s", te.Field)
+		})
+
+		t.Run("overflow is also a TypeError", func(t *testing.T) {
+			t.Parallel()
+			var got int8
+			err := decode(t, "i300e", &got)
+			require.Error(t, err)
+
+			var te *TypeError
+			require.ErrorAs(t, err, &te)
+			assert.Equal(t, "integer", te.Value)
+			assert.Equal(t, reflect.TypeFor[int8](), te.Type)
+			assert.ErrorIs(t, te, ErrOverflow)
+		})
+	})
+
+	t.Run("LimitError names the limit it hit", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("MaxStringBytes", func(t *testing.T) {
+			t.Parallel()
+			var got []byte
+			err := decodeWith(t, tinyDecoder("100:"+repeat("x", 100)), &got)
+			require.Error(t, err)
+
+			var le *LimitError
+			require.ErrorAs(t, err, &le)
+			assert.Equal(t, "MaxStringBytes", le.Limit)
+			assert.Equal(t, int64(100), le.Value, "the declared length that was refused")
+			assert.ErrorIs(t, le, ErrExceedsMax)
+		})
+
+		t.Run("MaxDepth", func(t *testing.T) {
+			t.Parallel()
+			var got any
+			err := decodeWith(t, tinyDecoder(nest(64)), &got)
+			require.Error(t, err)
+
+			var le *LimitError
+			require.ErrorAs(t, err, &le)
+			assert.Equal(t, "MaxDepth", le.Limit)
+			assert.ErrorIs(t, le, ErrMaxDepth)
+		})
+
+		t.Run("MaxValueBytes", func(t *testing.T) {
+			t.Parallel()
+			var got any
+			err := decodeWith(t, tinyDecoder("l"+repeat("i0e", 200)+"e"), &got)
+			require.Error(t, err)
+
+			var le *LimitError
+			require.ErrorAs(t, err, &le)
+			assert.Equal(t, "MaxValueBytes", le.Limit)
+			assert.ErrorIs(t, le, ErrExceedsMax)
+		})
+	})
+}
+
+// SPEC §5.3: io.EOF means "no more values"; io.ErrUnexpectedEOF means "broken
 // input". Conflating them is how a truncated file looks like a clean one.
-func TestSpec5_2_EOF(t *testing.T) {
+func TestSpec5_3_EOF(t *testing.T) {
 	t.Parallel()
 
 	t.Run("empty input is a clean end of stream", func(t *testing.T) {
@@ -1203,6 +1662,22 @@ func TestSpec5_2_EOF(t *testing.T) {
 
 		var second int
 		assert.ErrorIs(t, decodeWith(t, d, &second), io.EOF)
+	})
+
+	// SPEC §5.3: io.EOF is sticky. This is what makes the standard
+	// `for { if err == io.EOF { break } }` loop terminate instead of spinning
+	// on a decoder that has run dry.
+	t.Run("io.EOF is returned forever", func(t *testing.T) {
+		t.Parallel()
+		d := NewDecoder(strings.NewReader("i1e"))
+
+		var first int
+		require.NoError(t, decodeWith(t, d, &first))
+
+		for i := range 3 {
+			var v any
+			assert.ErrorIs(t, decodeWith(t, d, &v), io.EOF, "call %d", i+2)
+		}
 	})
 
 	truncated := []struct {
@@ -1237,7 +1712,7 @@ func TestSpec5_2_EOF(t *testing.T) {
 	}
 }
 
-// SPEC §5: strconv, reflect and every other implementation detail stays
+// SPEC §5.1: strconv, reflect and every other implementation detail stays
 // inside. An error a caller cannot classify is an error a caller cannot handle.
 func TestSpec5_NoUnclassifiableErrors(t *testing.T) {
 	t.Parallel()
@@ -1255,14 +1730,14 @@ func TestSpec5_NoUnclassifiableErrors(t *testing.T) {
 		"4spam", "4:", "10:abc", "05:hello", "0000004:spam", "9000000:short",
 		"l", "li1e", "le", "l4:spame",
 		"d", "d3:foo", "d3:fooe", "di1ei2ee", "de", "d1:s4:spame",
-		nest(200),
+		nest(200), "l" + repeat("i0e", 500) + "e",
 	}
 
 	for _, in := range corpus {
 		t.Run(fmt.Sprintf("%q", truncateName(in)), func(t *testing.T) {
 			t.Parallel()
 			var got any
-			err := decode(t, in, &got)
+			err := decodeWith(t, tinyDecoder(in), &got)
 			if err == nil {
 				return
 			}
@@ -1271,16 +1746,9 @@ func TestSpec5_NoUnclassifiableErrors(t *testing.T) {
 					return
 				}
 			}
-			t.Fatalf("error %#v matches no sentinel in SPEC §5", err)
+			t.Fatalf("error %#v matches no sentinel in SPEC §5.1", err)
 		})
 	}
-}
-
-func truncateName(s string) string {
-	if len(s) > 24 {
-		return s[:24] + "..."
-	}
-	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,92 +1757,145 @@ func truncateName(s string) string {
 // This is the invariant that keeps a decoder honest. A desynced decoder
 // corrupts every value after its first mistake, and nothing else in this file
 // would notice.
+//
+// Draft 1 promised that ErrTypeMismatch and ErrOverflow left the stream
+// aligned. That guarantee was only true for a mismatch at the top level of a
+// value: a mismatch on the third pair of a ten-pair dict leaves seven pairs
+// and a terminator unread. §6.2 records the reason this decoder cannot offer
+// what encoding/json does — it is single-pass, where json delimits a complete
+// value with a scanner before touching the destination. So the table below is
+// the inverse of draft 1's: every one of these inputs poisons.
 // ---------------------------------------------------------------------------
 
-func TestSpec6_RecoverableErrorsLeaveTheStreamAligned(t *testing.T) {
+func TestSpec6_1_EveryErrorPoisons(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name string
-		bad  string // a complete, well-formed value the destination cannot hold
+		bad  string
 		dst  func() any
 	}{
+		// Type mismatches. Every one of these is a complete, well-formed value
+		// the destination cannot hold — draft 1 expected recovery from all of
+		// them.
 		{"list into int", "li1ee", func() any { return new(int) }},
 		{"dict into int", "d1:a1:be", func() any { return new(int) }},
 		{"dict into slice", "d1:a1:be", func() any { return new([]string) }},
 		{"int into slice", "i1e", func() any { return new([]string) }},
 		{"int into string", "i1e", func() any { return new(string) }},
-		// The string path is the one that gets this wrong: the payload has
-		// already been consumed, so skipping again eats the NEXT value.
 		{"string into map", "4:spam", func() any { return new(map[string]string) }},
 		{"string into int", "4:spam", func() any { return new(int) }},
 		{"nested dict into int", "d1:ad1:bl1:ceee", func() any { return new(int) }},
 		{"short string into byte array", "4:spam", func() any { return new([20]byte) }},
+		// This one exposed the contradiction inside draft 1: §4 required the
+		// non-string key type to be rejected BEFORE any entry was decoded,
+		// which leaves the stream just past the 'd' — while §6 claimed the
+		// whole value had been consumed. Both cannot hold. §4 wins; the
+		// decoder is poisoned.
 		{"non-string key map", "d1:11:ae", func() any { return new(map[int]string) }},
-		// SPEC §7.5: overflow is recoverable — the value was fully consumed.
-		{"overflow", "i300e", func() any { return new(int8) }},
+		{"mismatch inside a container", "d1:sli1eee", func() any { return new(simple) }},
+
+		// Overflow.
+		{"overflow into narrow int", "i300e", func() any { return new(int8) }},
 		{"overflow beyond int64", "i99999999999999999999e", func() any { return new(int64) }},
+
+		// Syntax.
+		{"unknown type byte", "x", func() any { return new(any) }},
+		{"malformed int", "iabce", func() any { return new(any) }},
+		{"non-string dict key", "di1ei2ee", func() any { return new(any) }},
+
+		// Truncation.
+		{"truncated list", "l", func() any { return new(any) }},
+		{"truncated dict value", "d3:fooi42", func() any { return new(any) }},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			d := NewDecoder(strings.NewReader(tt.bad + "i42e"))
+			r := &countingReader{src: strings.NewReader(tt.bad + "i42e")}
+			d := NewDecoder(r)
 
-			require.Error(t, decodeWith(t, d, tt.dst()))
-
-			var after int
-			require.NoError(t, decodeWith(t, d, &after),
-				"decoder desynced: the rejected value was not consumed exactly")
-			assert.Equal(t, 42, after)
-		})
-	}
-}
-
-func TestSpec6_Poisoning(t *testing.T) {
-	t.Parallel()
-
-	poisoning := []struct {
-		name string
-		bad  string
-	}{
-		{"syntax error", "x"},
-		{"malformed int", "iabce"},
-		{"truncated value", "l"},
-		{"nesting over the limit", nest(200)},
-	}
-
-	for _, tt := range poisoning {
-		t.Run(tt.name+" is sticky", func(t *testing.T) {
-			t.Parallel()
-			d := NewDecoder(strings.NewReader(tt.bad + "i42e"))
-
-			first := decodeWith(t, d, new(any))
+			first := decodeWith(t, d, tt.dst())
 			require.Error(t, first)
+			consumed := r.read
 
 			var after int
 			second := decodeWith(t, d, &after)
 			require.Error(t, second,
 				"a poisoned decoder must not pretend it found the next value")
 			assert.Equal(t, first, second, "the stored error is returned verbatim")
-			assert.Equal(t, 0, after)
+			assert.Zero(t, after, "the destination must be untouched")
+			assert.Equal(t, consumed, r.read, "a poisoned decoder must not read further")
 		})
 	}
-
-	t.Run("a poisoned decoder reads nothing further", func(t *testing.T) {
-		t.Parallel()
-		r := &countingReader{src: strings.NewReader("x" + repeat("i42e", 1000))}
-		d := NewDecoder(r)
-
-		require.Error(t, decodeWith(t, d, new(any)))
-		before := r.read
-
-		require.Error(t, decodeWith(t, d, new(any)))
-		assert.Equal(t, before, r.read, "poisoned decoder pulled more bytes")
-	})
 }
 
-func TestSpec6_SuccessivePositioning(t *testing.T) {
+func TestSpec6_1_LimitErrorsPoison(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		bad  string
+	}{
+		{"nesting over the limit", nest(64)},
+		{"string over the limit", "100:" + repeat("x", 100)},
+		{"value over the limit", "l" + repeat("i0e", 200) + "e"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := tinyDecoder(tt.bad + "i42e")
+
+			first := decodeWith(t, d, new(any))
+			require.Error(t, first)
+
+			var after int
+			require.Error(t, decodeWith(t, d, &after))
+			assert.Zero(t, after)
+		})
+	}
+}
+
+// SPEC §6.1: "the decoder stores the error and every later Decode returns THAT
+// SAME error". Identity, not equality — a decoder that rebuilds an equivalent
+// error on each call is doing work it promised not to do, and would read the
+// stream to do it.
+func TestSpec6_1_PoisonedErrorIsIdentical(t *testing.T) {
+	t.Parallel()
+
+	d := NewDecoder(strings.NewReader("x" + repeat("i42e", 100)))
+
+	first := decodeWith(t, d, new(any))
+	require.Error(t, first)
+
+	second := decodeWith(t, d, new(any))
+	require.Error(t, second)
+	assert.Same(t, first, second)
+}
+
+// SPEC §6.3: the escape hatch. A caller who wants to tolerate a value of an
+// unexpected shape decodes into `any` first, which can never produce a type
+// error and therefore never poisons.
+func TestSpec6_3_DecodingIntoAnyNeverTypeErrors(t *testing.T) {
+	t.Parallel()
+
+	d := NewDecoder(strings.NewReader("li1eed1:a1:bei42e"))
+
+	var first any
+	require.NoError(t, decodeWith(t, d, &first))
+	assert.Equal(t, []any{int64(1)}, first)
+
+	var second any
+	require.NoError(t, decodeWith(t, d, &second))
+	assert.Equal(t, map[string]any{"a": "b"}, second)
+
+	var third int
+	require.NoError(t, decodeWith(t, d, &third))
+	assert.Equal(t, 42, third)
+}
+
+func TestSpec6_1_SuccessivePositioning(t *testing.T) {
 	t.Parallel()
 
 	d := NewDecoder(strings.NewReader("i1e4:spamli2eed1:s1:xe"))
@@ -1399,6 +1920,59 @@ func TestSpec6_SuccessivePositioning(t *testing.T) {
 	assert.ErrorIs(t, decodeWith(t, d, &f), io.EOF)
 }
 
+// SPEC §6.4 — Unmarshal is the one place the leniency of §2.1 is withdrawn.
+// A caller who handed over a finite byte slice asserted that the slice IS the
+// message, so anything after the value is an error.
+func TestSpec6_4_Unmarshal(t *testing.T) {
+	t.Parallel()
+
+	t.Run("decodes a single value", func(t *testing.T) {
+		t.Parallel()
+		var got simple
+		require.NoError(t, Unmarshal([]byte("d1:s4:spam1:ii7ee"), &got))
+		assert.Equal(t, simple{S: "spam", I: 7}, got)
+	})
+
+	t.Run("rejects trailing bytes", func(t *testing.T) {
+		t.Parallel()
+		var got int
+		err := Unmarshal([]byte("i42egarbage"), &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrSyntax)
+
+		var se *SyntaxError
+		require.ErrorAs(t, err, &se)
+		assert.Equal(t, int64(4), se.Offset, "the offset of the first trailing byte")
+	})
+
+	// bencode permits whitespace nowhere, so a stray newline is trailing data
+	// like any other byte. Worth its own case because every other format
+	// tolerates it and the habit carries over.
+	t.Run("rejects trailing whitespace", func(t *testing.T) {
+		t.Parallel()
+		var got int
+		err := Unmarshal([]byte("i42e\n"), &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrSyntax)
+	})
+
+	t.Run("accepts a second value's worth of nothing", func(t *testing.T) {
+		t.Parallel()
+		var got []string
+		require.NoError(t, Unmarshal([]byte("l1:a1:be"), &got))
+		assert.Equal(t, []string{"a", "b"}, got)
+	})
+
+	t.Run("propagates the same errors as Decode", func(t *testing.T) {
+		t.Parallel()
+		var got int
+		assert.ErrorIs(t, Unmarshal([]byte("4:spam"), &got), ErrTypeMismatch)
+		assert.ErrorIs(t, Unmarshal([]byte("x"), &got), ErrSyntax)
+		assert.ErrorIs(t, Unmarshal([]byte("i42"), &got), io.ErrUnexpectedEOF)
+		assert.ErrorIs(t, Unmarshal([]byte("i42e"), got), ErrInvalidDestination)
+	})
+}
+
 // ---------------------------------------------------------------------------
 // SPEC §7 — limits
 //
@@ -1407,17 +1981,55 @@ func TestSpec6_SuccessivePositioning(t *testing.T) {
 // to error without spending the machine's memory or stack first.
 // ---------------------------------------------------------------------------
 
+// SPEC §7.1: Limits is read at the start of each Decode, and a zero field
+// means "use the default". Without the second half, a caller who overrides one
+// bound silently sets every other one to zero and nothing decodes at all.
+func TestSpec7_1_Configuration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero fields fall back to defaults", func(t *testing.T) {
+		t.Parallel()
+		d := NewDecoder(strings.NewReader("d1:s4:spame"))
+		d.Limits = Limits{MaxDepth: 8} // everything else zero
+
+		var got simple
+		require.NoError(t, decodeWith(t, d, &got),
+			"a zero MaxStringBytes must mean the default, not a zero-byte ceiling")
+		assert.Equal(t, "spam", got.S)
+	})
+
+	t.Run("an override takes effect", func(t *testing.T) {
+		t.Parallel()
+		var got string
+		err := decodeWith(t, tinyDecoder("100:"+repeat("x", 100)), &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrExceedsMax)
+	})
+
+	t.Run("limits are re-read between calls", func(t *testing.T) {
+		t.Parallel()
+		big := "100:" + repeat("x", 100)
+		d := NewDecoder(strings.NewReader(big + big))
+
+		var first string
+		require.NoError(t, decodeWith(t, d, &first), "default limits accept this")
+
+		d.Limits.MaxStringBytes = 64
+
+		var second string
+		err := decodeWith(t, d, &second)
+		require.Error(t, err, "the tightened limit must apply to the next value")
+		assert.ErrorIs(t, err, ErrExceedsMax)
+	})
+}
+
 func TestSpec7_Depth(t *testing.T) {
 	t.Parallel()
 
-	// 200 is over the documented default of 128 and shallow enough to be
-	// harmless if the limit is missing. Do not raise it to provoke a real
-	// stack overflow: that is not a panic, cannot be recovered, and takes the
-	// whole test binary down.
 	t.Run("over the limit is ErrMaxDepth", func(t *testing.T) {
 		t.Parallel()
 		var got any
-		err := decode(t, nest(200), &got)
+		err := decodeWith(t, tinyDecoder(nest(64)), &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrMaxDepth)
 	})
@@ -1425,41 +2037,64 @@ func TestSpec7_Depth(t *testing.T) {
 	t.Run("under the limit is accepted", func(t *testing.T) {
 		t.Parallel()
 		var got any
-		require.NoError(t, decode(t, nest(100), &got))
+		require.NoError(t, decodeWith(t, tinyDecoder(nest(8)), &got))
+	})
+
+	// The default is exercised separately from the configurable path, because
+	// a bug that reads the wrong field would pass every tinyLimits test.
+	// 200 is over the documented default of 128 and shallow enough to be
+	// harmless if the limit is missing entirely. Do not raise it to provoke a
+	// real stack overflow: that is not a panic, cannot be recovered, and takes
+	// the whole test binary down.
+	t.Run("the default limit applies when unconfigured", func(t *testing.T) {
+		t.Parallel()
+		var got any
+		err := decode(t, nest(200), &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxDepth)
+
+		var ok any
+		require.NoError(t, decode(t, nest(100), &ok))
 	})
 
 	t.Run("the limit applies to dicts too", func(t *testing.T) {
 		t.Parallel()
 		var got any
-		err := decode(t, repeat("d1:k", 200)+repeat("e", 200), &got)
+		err := decodeWith(t, tinyDecoder(repeat("d1:k", 64)+repeat("e", 64)), &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrMaxDepth)
 	})
 
-	// A depth limit that only guards values you keep is not a limit.
+	// SPEC §7.2 rule 3. A depth limit that only guards values you keep is not
+	// a limit.
 	t.Run("the limit applies while skipping", func(t *testing.T) {
 		t.Parallel()
-		input := "d9:a_unknown" + nest(200) + "1:s5:helloe"
+		input := "d9:a_unknown" + nest(64) + "1:s5:helloe"
 
 		var got simple
-		err := decode(t, input, &got)
+		err := decodeWith(t, tinyDecoder(input), &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrMaxDepth)
 	})
 }
 
-func TestSpec7_BoundedScans(t *testing.T) {
+func TestSpec7_2_BoundedScans(t *testing.T) {
 	t.Parallel()
 
-	const junk = 8 << 20 // no terminator anywhere in 8 MiB
-	const allowed = 1 << 20
+	// With tinyLimits the scan bounds are tens of bytes, so a few hundred
+	// bytes of junk is already far past every one of them. The assertion is
+	// that the decoder stops early — not where exactly it stops.
+	const junk = 4096
+	const allowed = 512
 
 	t.Run("integer with no terminator", func(t *testing.T) {
 		t.Parallel()
 		r := &countingReader{src: strings.NewReader("i" + repeat("1", junk))}
+		d := NewDecoder(r)
+		d.Limits = tinyLimits()
 
 		var got int
-		err := NewDecoder(r).Decode(&got)
+		err := decodeWith(t, d, &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrExceedsMax)
 		assert.Less(t, r.read, allowed,
@@ -1469,49 +2104,65 @@ func TestSpec7_BoundedScans(t *testing.T) {
 	t.Run("string length with no colon", func(t *testing.T) {
 		t.Parallel()
 		r := &countingReader{src: strings.NewReader(repeat("1", junk))}
+		d := NewDecoder(r)
+		d.Limits = tinyLimits()
 
 		var got string
-		err := NewDecoder(r).Decode(&got)
+		err := decodeWith(t, d, &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrExceedsMax)
 		assert.Less(t, r.read, allowed,
 			"read %d bytes hunting for ':'; the scan must be bounded", r.read)
 	})
 
-	// SPEC §7.3. Skipping is exactly where limits get forgotten.
+	// SPEC §7.2 rule 3. Skipping is exactly where limits get forgotten.
 	t.Run("skipping an unterminated integer is bounded", func(t *testing.T) {
 		t.Parallel()
 		r := &countingReader{src: strings.NewReader("d9:a_unknowni" + repeat("1", junk))}
+		d := NewDecoder(r)
+		d.Limits = tinyLimits()
 
 		var got simple
-		err := NewDecoder(r).Decode(&got)
+		err := decodeWith(t, d, &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrExceedsMax)
 		assert.Less(t, r.read, allowed,
 			"read %d bytes skipping an unterminated int", r.read)
 	})
 
-	// SPEC §7.5: inside the scan window but outside int64 is a recoverable
-	// ErrOverflow; beyond the window it is ErrExceedsMax and the decoder dies.
+	// SPEC §7.2 rule 5: inside the internal scan window but outside int64 is
+	// ErrOverflow; beyond the window it is ErrExceedsMax. Both poison — the
+	// distinction is diagnostic. maxIntBytes is not configurable, so this uses
+	// the real bound.
 	t.Run("oversized integer is ErrExceedsMax not ErrOverflow", func(t *testing.T) {
 		t.Parallel()
 		var got int64
 		err := decode(t, "i"+repeat("9", 200)+"e", &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrExceedsMax)
+		assert.NotErrorIs(t, err, ErrOverflow)
+	})
+
+	t.Run("an integer just outside int64 is ErrOverflow", func(t *testing.T) {
+		t.Parallel()
+		var got int64
+		err := decode(t, "i99999999999999999999e", &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrOverflow)
+		assert.NotErrorIs(t, err, ErrExceedsMax)
 	})
 }
 
-func TestSpec7_StringSize(t *testing.T) {
+func TestSpec7_1_StringSize(t *testing.T) {
 	t.Parallel()
 
-	// SPEC §7.1: the declared length is checked before anything is allocated.
-	// 9 MiB is over the 8 MiB default; the payload is four bytes long, so an
-	// implementation that allocates first will also read far past the limit.
+	// SPEC §7.2 rule 1: the DECLARED length is checked before anything is
+	// allocated. The payload here is four bytes, so an implementation that
+	// allocates first will also read far past the limit.
 	t.Run("declared length over the limit is rejected before allocating", func(t *testing.T) {
 		t.Parallel()
 		var got []byte
-		err := decode(t, "9000000:tiny", &got)
+		err := decodeWith(t, tinyDecoder("100:tiny"), &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrExceedsMax)
 		assert.Nil(t, got)
@@ -1520,7 +2171,7 @@ func TestSpec7_StringSize(t *testing.T) {
 	t.Run("declared length under the limit but past the payload is a truncation", func(t *testing.T) {
 		t.Parallel()
 		var got []byte
-		err := decode(t, "1000000:short", &got)
+		err := decodeWith(t, tinyDecoder("60:short"), &got)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	})
@@ -1534,14 +2185,87 @@ func TestSpec7_StringSize(t *testing.T) {
 	})
 }
 
-// SPEC §7.4: a peer that sends one unknown key holding a large value must not
-// make you allocate all of it for nothing.
-func TestSpec7_SkipDoesNotAllocateTheSkippedValue(t *testing.T) {
-	// Not parallel: measures process-wide allocation.
+// SPEC §7.3 — the limit draft 1 was missing. Depth and string length together
+// bound nothing that grows by REPETITION: a million-element list of `i0e`
+// passes every other check while the destination slice grows linearly with the
+// input, and on a socket the input has no end.
+func TestSpec7_3_MaxValueBytes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a long flat list is refused", func(t *testing.T) {
+		t.Parallel()
+		var got []int
+		err := decodeWith(t, tinyDecoder("l"+repeat("i0e", 500)+"e"), &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrExceedsMax)
+	})
+
+	t.Run("a wide flat dict is refused", func(t *testing.T) {
+		t.Parallel()
+		var sb strings.Builder
+		sb.WriteString("d")
+		for i := range 200 {
+			fmt.Fprintf(&sb, "4:k%03d1:v", i)
+		}
+		sb.WriteString("e")
+
+		var got map[string]string
+		err := decodeWith(t, tinyDecoder(sb.String()), &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrExceedsMax)
+	})
+
+	t.Run("the decoder stops reading at the limit", func(t *testing.T) {
+		t.Parallel()
+		r := &countingReader{src: strings.NewReader("l" + repeat("i0e", 5000) + "e")}
+		d := NewDecoder(r)
+		d.Limits = tinyLimits()
+
+		var got []int
+		require.Error(t, decodeWith(t, d, &got))
+		assert.Less(t, r.read, 4096,
+			"read %d bytes past a 256-byte value limit", r.read)
+	})
+
+	// SPEC §7.2 rule 3 again: skipping is not a way around a limit.
+	t.Run("the limit applies while skipping", func(t *testing.T) {
+		t.Parallel()
+		input := "d9:a_unknownl" + repeat("i0e", 500) + "e1:s5:helloe"
+
+		var got simple
+		err := decodeWith(t, tinyDecoder(input), &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrExceedsMax)
+	})
+
+	t.Run("the budget resets between values", func(t *testing.T) {
+		t.Parallel()
+		one := "l" + repeat("i0e", 50) + "e" // 152 bytes, under the 256 limit
+		d := tinyDecoder(one + one + one)
+
+		for i := range 3 {
+			var got []int
+			require.NoError(t, decodeWith(t, d, &got),
+				"value %d: the budget is per top-level value, not per stream", i+1)
+			assert.Len(t, got, 50)
+		}
+	})
+}
+
+// SPEC §7.2 rule 4: a peer that sends one unknown key holding a large value
+// must not make you allocate all of it for nothing.
+func TestSpec7_2_SkipDoesNotAllocateTheSkippedValue(t *testing.T) {
+	// Deliberately NOT parallel: allocatedBytes reads process-wide counters.
+	// `go test` runs non-parallel tests to completion before resuming parallel
+	// ones, which is the only thing keeping this measurement honest. Adding
+	// t.Parallel() here silently turns it into noise.
 
 	const size = 4 << 20
 	input := "d9:a_unknown" + fmt.Sprintf("%d:%s", size, repeat("x", size)) + "1:s5:helloe"
 
+	// Default limits: the skipped string is 4 MiB, under the 8 MiB default,
+	// so it is legal — the point is that legality does not mean materialising
+	// it.
 	var got simple
 	var err error
 	allocated := allocatedBytes(func() {
@@ -1561,49 +2285,84 @@ func TestSpec7_SkipDoesNotAllocateTheSkippedValue(t *testing.T) {
 func TestSpec8_NeverPanics(t *testing.T) {
 	t.Parallel()
 
-	// Destinations chosen for the reflect operations that panic when unguarded:
-	// SetMapIndex with a mismatched key type, Set with an unassignable value.
-	dsts := []struct {
-		name string
-		new  func() any
-	}{
-		{"any", func() any { return new(any) }},
-		{"int", func() any { return new(int) }},
-		{"string", func() any { return new(string) }},
-		{"[4]byte", func() any { return new([4]byte) }},
-		// Same length as "spam", but reflect.Copy rejects arrays of a
-		// different element type — a length check alone does not make the
-		// copy legal.
-		{"[4]string", func() any { return new([4]string) }},
-		// Kind() is String but Type() is not string, so a plain
-		// AssignableTo on the key fails where a Convert would succeed.
-		{"map[namedKey]string", func() any { return new(map[namedKey]string) }},
-		{"map[int]string", func() any { return new(map[int]string) }},
-		{"map[string]int", func() any { return new(map[string]int) }},
-		{"map[bool]any", func() any { return new(map[bool]any) }},
-		{"non-empty interface", func() any { return new(io.Reader) }},
-		{"chan", func() any { return new(chan int) }},
-		{"func", func() any { return new(func()) }},
-		{"struct", func() any { return new(simple) }},
-		{"pointer", func() any { return new(*simple) }},
-	}
-
 	inputs := []string{
 		"", "x", "e", "i1e", "i-1e", "4:spam", "0:", "le", "de",
 		"l4:spame", "li1ee", "d1:s4:spame", "d1:si1ee", "di1ei2ee",
 		"d1:11:ae", "l" + repeat("i1e", 5) + "e", "d0:0:e",
+		nest(64), "l" + repeat("i0e", 500) + "e", "100:" + repeat("x", 100),
 	}
 
-	for _, dst := range dsts {
+	for _, dst := range everyDestinationShape {
 		for _, in := range inputs {
 			t.Run(dst.name+"/"+fmt.Sprintf("%q", truncateName(in)), func(t *testing.T) {
 				t.Parallel()
 				// decode() turns any panic into a hard failure. The returned
 				// error is irrelevant here — only the absence of a panic is.
-				_ = decode(t, in, dst.new())
+				_ = decodeWith(t, tinyDecoder(in), dst.new())
 			})
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC §10.1 — concurrency
+// ---------------------------------------------------------------------------
+
+// The field map cache (§3.3.2) is shared across every decoder in the process,
+// so the claim that it is safe without locking needs a standing check. Run
+// under -race; without it this test proves almost nothing.
+//
+// The fixture type is declared inside the test so the cache entry is cold when
+// the goroutines start: a warm entry means every goroutine takes the read path
+// and the publish race is never exercised.
+func TestSpec10_1_FieldCacheIsConcurrencySafe(t *testing.T) {
+	t.Parallel()
+
+	type coldType struct {
+		A string            `bencode:"a"`
+		B int64             `bencode:"b"`
+		C []string          `bencode:"c"`
+		D map[string]string `bencode:"d"`
+	}
+
+	input := mustEncode(t, bencodeast.Dict{
+		"a": bencodeast.Str("x"),
+		"b": bencodeast.Int(1),
+		"c": bencodeast.List{bencodeast.Str("y")},
+		"d": bencodeast.Dict{"k": bencodeast.Str("v")},
+	})
+
+	const goroutines = 64
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
+	start := make(chan struct{})
+	for range goroutines {
+		wg.Go(func() {
+			<-start // maximise the overlap on the cold cache entry
+
+			var got coldType
+			if err := NewDecoder(strings.NewReader(input)).Decode(&got); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				return
+			}
+			if got.A != "x" || got.B != 1 {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("bad decode: %+v", got))
+				mu.Unlock()
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Empty(t, errs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,30 +2429,38 @@ func TestDecode_RealTorrent(t *testing.T) {
 // ---------------------------------------------------------------------------
 // fuzz
 //
-// The tables above assert what the spec says. Fuzzing asserts the two things a
-// table can never cover: that no input panics (SPEC §8), and that decoding is
-// self-consistent.
-//
-// The oracle is deliberately re-encode-and-redecode rather than a differential
-// comparison against bencode_ast: that decoder has its own limits and its own
-// empty-key handling, so disagreement between them would prove nothing.
+// The tables above assert what the spec says. Fuzzing asserts what a table can
+// never cover: that no input panics (SPEC §8), that decoding is
+// self-consistent, and that error offsets stay inside the input.
 // ---------------------------------------------------------------------------
 
+var fuzzSeeds = []string{
+	"i0e", "i-1e", "i42e", "0:", "4:spam", "le", "de",
+	"l4:spami1ee", "d3:cow3:mooe", "d1:ald1:bi1eeee",
+	"d5:filesld6:lengthi1e4:pathl1:aeeee",
+	"x", "i", "iabce", "4spam", "10:abc", "l", "d3:foo", "di1ei2ee",
+	"i03e", "i-0e", "05:hello", nest(20), "l" + repeat("i0e", 300) + "e",
+}
+
+// FuzzDecodeAny checks that anything this decoder accepts survives a round
+// trip, and that anything it rejects reports a position inside the input.
+//
+// The oracle is re-encode-and-redecode rather than a differential comparison
+// against bencode_ast: that decoder has its own limits and its own empty-key
+// handling, so disagreement between them would prove nothing.
 func FuzzDecodeAny(f *testing.F) {
-	seeds := []string{
-		"i0e", "i-1e", "i42e", "0:", "4:spam", "le", "de",
-		"l4:spami1ee", "d3:cow3:mooe", "d1:ald1:bi1eeee",
-		"d5:filesld6:lengthi1e4:pathl1:aeeee",
-		"x", "i", "iabce", "4spam", "10:abc", "l", "d3:foo", "di1ei2ee",
-		"i03e", "i-0e", "05:hello", nest(20),
-	}
-	for _, s := range seeds {
+	for _, s := range fuzzSeeds {
 		f.Add([]byte(s))
 	}
 
 	f.Fuzz(func(t *testing.T, in []byte) {
 		var first any
 		if err := NewDecoder(bytes.NewReader(in)).Decode(&first); err != nil {
+			// SPEC §5.2: an offset outside the input means the consumed
+			// counter has drifted. That counter is also what RawMessage
+			// capture (§9.4) and MaxValueBytes (§7.3) are built on, so this
+			// one assertion guards three mechanisms.
+			assertOffsetInBounds(t, err, int64(len(in)))
 			return
 		}
 
@@ -1709,6 +2476,53 @@ func FuzzDecodeAny(f *testing.F) {
 		require.True(t, reflect.DeepEqual(first, second),
 			"decoding is not idempotent:\nfirst:  %#v\nsecond: %#v", first, second)
 	})
+}
+
+// FuzzDecodeIntoEveryDestination is the standing test for SPEC §8. The §8
+// table pairs 21 destinations with 20 hand-written inputs; this pairs the same
+// destinations with inputs nobody thought of. A panic here is the failure —
+// the returned error is irrelevant.
+func FuzzDecodeIntoEveryDestination(f *testing.F) {
+	for _, s := range fuzzSeeds {
+		f.Add([]byte(s))
+	}
+
+	f.Fuzz(func(t *testing.T, in []byte) {
+		for _, dst := range everyDestinationShape {
+			d := NewDecoder(bytes.NewReader(in))
+			d.Limits = tinyLimits()
+
+			err := d.Decode(dst.new())
+			if err != nil {
+				assertOffsetInBounds(t, err, int64(len(in)))
+			}
+		}
+	})
+}
+
+// assertOffsetInBounds checks that whichever structured error came back
+// reports a position within the input that produced it.
+func assertOffsetInBounds(t *testing.T, err error, n int64) {
+	t.Helper()
+
+	var offset int64
+	var se *SyntaxError
+	var te *TypeError
+	var le *LimitError
+
+	switch {
+	case errors.As(err, &se):
+		offset = se.Offset
+	case errors.As(err, &te):
+		offset = te.Offset
+	case errors.As(err, &le):
+		offset = le.Offset
+	default:
+		return // ErrInvalidDestination and bare io.EOF carry no position
+	}
+
+	require.GreaterOrEqual(t, offset, int64(0), "negative offset in %v", err)
+	require.LessOrEqual(t, offset, n, "offset past the end of a %d byte input in %v", n, err)
 }
 
 // toAST converts the result of decoding into `any` back into a bencode AST.
@@ -1742,82 +2556,5 @@ func toAST(v any) (bencodeast.Value, bool) {
 		return d, true
 	default:
 		return nil, false
-	}
-}
-
-func TestGetTag(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		tag        string
-		expected   string
-		expectedOk bool
-	}{
-		{tag: "tag", expected: "tag", expectedOk: true},
-		{tag: "tag,", expected: "tag", expectedOk: true},
-		{tag: "-,", expected: "-", expectedOk: true},
-		{tag: "tag,opt1", expected: "tag", expectedOk: true},
-		{tag: ",opt1", expected: "", expectedOk: true},
-		{tag: "", expected: "", expectedOk: true},
-		{tag: "-", expected: ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.tag, func(t *testing.T) {
-			t.Parallel()
-			tag, ok := getTag(tt.tag)
-			require.Equal(t, tt.expected, tag)
-			assert.Equal(t, tt.expectedOk, ok)
-
-		})
-	}
-}
-
-func TestSplitTag(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		tag      string
-		expected []string
-	}{
-		{tag: "tag", expected: []string{"tag"}},
-		{tag: "tag,opt1", expected: []string{"tag", "opt1"}},
-		{tag: "tag,opt1,opt2", expected: []string{"tag", "opt1", "opt2"}},
-		{tag: "-", expected: []string{"-"}},
-		{tag: ",opt", expected: []string{"", "opt"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.tag, func(t *testing.T) {
-			t.Parallel()
-			opts := splitTag(tt.tag)
-			require.Equal(t, tt.expected, opts)
-		})
-	}
-}
-
-func TestCount(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		s        string
-		ch       byte
-		expected int
-	}{
-		{"test", 't', 2},
-		{"test", 'a', 0},
-		{"test", 'e', 1},
-		{"test,", ',', 1},
-		{"", ',', 0},
-		{"test", 0, 0},
-		{"test", 0, 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.s, func(t *testing.T) {
-			t.Parallel()
-			c := count(tt.s, tt.ch)
-			require.Equal(t, tt.expected, c)
-		})
 	}
 }

@@ -2,23 +2,32 @@ package bencoderef
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 )
 
 const (
-	tagName            = "bencode"
-	MaxStringLenDigits = 7   // TODO: it needs to be adjusted
-	MaxIntDigits       = 20  // TODO: it needs to be adjusted
-	MaxRecurtionDepth  = 128 // TODO: it needs to be adjusted
+	tagName                  = "bencode"
+	DefaultMaxStringBytes    = 7 << 20
+	DefaultMaxCaptureBytes   = 64 << 20
+	DefaultMaxValueBytes     = 64 << 20
+	DefaultMaxRecursionDepth = 128
+)
+
+const (
+	maxRecBufRetained = 64 << 10
+	maxInt64Digits    = 20
 )
 
 var (
+	ErrInternal        = errors.New("internal error")
 	ErrUnsupportedType = errors.New("unsupported type")
 	ErrSyntax          = errors.New("syntax error")
 
@@ -26,9 +35,10 @@ var (
 	ErrNegativeZero = fmt.Errorf("%w: negative zero", ErrSyntax)
 	ErrEmpty        = fmt.Errorf("%w: empty", ErrSyntax)
 
-	ErrExceedsMax = errors.New("exceeds max")
-
+	ErrExceedsMax   = errors.New("exceeds max")
 	ErrTypeMismatch = errors.New("type mismatch")
+	ErrArrayLength  = fmt.Errorf("%w: array must be exact length", ErrTypeMismatch)
+
 	// ErrOverflow: the value parsed, but does not fit the destination's width.
 	ErrOverflow = errors.New("value overflows destination")
 	// ErrInvalidDestination: the destination itself is unusable — non-pointer,
@@ -38,32 +48,87 @@ var (
 	ErrMaxDepth = errors.New("max nesting depth exceeded")
 )
 
+var errCaptureTooLarge = errors.New("capture limit exceeded")
+
 type RawMessage []byte
 
 var rawMessageType = reflect.TypeFor[RawMessage]()
 
 var fieldCache sync.Map
 
-type reader interface {
-	io.ByteScanner
-	io.Reader
+type SyntaxError struct {
+	Offset int64
+	msg    string
+	cause  error
 }
 
-type discarder interface {
-	Discard(n int) (int, error)
+func (e *SyntaxError) Unwrap() error { return e.cause }
+func (e *SyntaxError) Error() string {
+	return e.msg
+}
+
+type TypeError struct {
+	Offset int64
+	Value  string       // "integer", "string", "list", "dict"
+	Type   reflect.Type // destination type
+	Struct string       // struct type name, if the value was a struct field
+	Field  string       // field key, if the value was a struct field
+	cause  error        // ErrTypeMismatch, ErrArrayLength or ErrOverflow
+}
+
+func (e *TypeError) Unwrap() error { return e.cause }
+func (e *TypeError) Error() string {
+	if e.Struct != "" || e.Field != "" {
+		return "cannot unmarshal " + e.Value + " into Go struct field " + e.Struct + "." + e.Field + " of type " + e.Type.String()
+	}
+	return "cannot unmarshal " + e.Value + " into Go value of type " + e.Type.String()
+}
+
+type LimitError struct {
+	Offset int64  // byte offset at which the limit was exceeded
+	Limit  string // "MaxStringBytes", "MaxDepth", "MaxValueBytes", ...
+	Value  int64  // the value that exceeded it, where meaningful
+	cause  error  // ErrExceedsMax or ErrMaxDepth
+}
+
+func (e *LimitError) Unwrap() error { return e.cause }
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("exceeds limit: %s, value: %d", e.Limit, e.Value)
+}
+
+type Limits struct {
+	MaxStringBytes  int64
+	MaxValueBytes   int64
+	MaxCaptureBytes int64
+	MaxDepth        uint
 }
 
 type Decoder struct {
-	br    reader
+	Limits Limits
+
+	br    *bufio.Reader
+	rec   *recorder
 	depth uint
 	err   error
 }
 
 func NewDecoder(r io.Reader) *Decoder {
-	if br, ok := r.(reader); ok {
-		return &Decoder{br: br}
+	rec := recorder{src: r}
+	d := Decoder{
+		br:  bufio.NewReader(&rec),
+		rec: &rec,
+		Limits: Limits{
+			MaxStringBytes:  DefaultMaxStringBytes,
+			MaxValueBytes:   DefaultMaxValueBytes,
+			MaxCaptureBytes: DefaultMaxCaptureBytes,
+			MaxDepth:        DefaultMaxRecursionDepth,
+		},
 	}
-	return &Decoder{br: bufio.NewReader(r)}
+	return &d
+}
+
+func Unmarshal(b []byte, v any) error {
+	return NewDecoder(bytes.NewBuffer(b)).Decode(v)
 }
 
 func (d *Decoder) Decode(a any) error {
@@ -81,23 +146,22 @@ func (d *Decoder) Decode(a any) error {
 func (d *Decoder) decode(v reflect.Value) error {
 	d.depth++
 	defer func() { d.depth-- }()
-	if d.depth >= MaxRecurtionDepth {
-		return ErrMaxDepth
-
+	if d.depth >= d.Limits.MaxDepth {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxDepth",
+			Value:  int64(d.Limits.MaxDepth),
+			cause:  ErrMaxDepth,
+		}
 	}
 
 	v = indirect(v)
 	if v.Kind() == reflect.Interface && v.Type().NumMethod() != 0 {
-		return ErrTypeMismatch
+		return &TypeError{Offset: d.offset(), Type: v.Type(), cause: ErrTypeMismatch}
 	}
 
 	if v.Type() == rawMessageType {
-		raw, err := d.readRawValue()
-		if err != nil {
-			return err
-		}
-		v.SetBytes(raw)
-		return nil
+		return d.decodeRawValue(v)
 	}
 
 	b, err := d.br.ReadByte()
@@ -123,17 +187,23 @@ func (d *Decoder) decode(v reflect.Value) error {
 }
 
 func (d *Decoder) decodeDict(v reflect.Value) error {
+	t := v.Type()
 	if !v.CanSet() {
-		return ErrInvalidDestination
+		return &TypeError{
+			Offset: d.offset(),
+			Value:  "dict",
+			Type:   t,
+			cause:  ErrInvalidDestination,
+		}
 	}
 	switch k := v.Kind(); k {
 	case reflect.Struct:
-		fields := cachedFields(v.Type())
+		fields := cachedFields(t)
 
 		for {
 			key, ok, err := d.readDictKey()
 			if err != nil {
-				return err
+				return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: err}
 			}
 			if !ok {
 				break
@@ -143,13 +213,20 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 			if !ok {
 				err = d.skipValue()
 				if err != nil {
-					return err
+					return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: err}
 				}
 				continue
 			}
 
 			if err := d.decode(v.Field(idx)); err != nil {
-				return err
+				return &TypeError{
+					Offset: d.offset(),
+					Value:  "dict",
+					Type:   t,
+					cause:  err,
+					Struct: t.Name(),
+					Field:  v.Field(idx).Type().Name(),
+				}
 			}
 		}
 	case reflect.Map, reflect.Interface:
@@ -158,14 +235,14 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 			t = reflect.TypeFor[map[string]any]()
 		}
 		if t.Key().Kind() != reflect.String {
-			return ErrTypeMismatch
+			return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: ErrTypeMismatch}
 		}
 		m := reflect.MakeMap(t)
 
 		for {
 			key, ok, err := d.readDictKey()
 			if err != nil {
-				return err
+				return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: err}
 			}
 			if !ok {
 				break
@@ -173,22 +250,14 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 
 			fieldDst := reflect.New(t.Elem())
 			if err := d.decode(fieldDst.Elem()); err != nil {
-				return err
+				return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: err}
 			}
 
 			m.SetMapIndex(reflect.ValueOf(key).Convert(t.Key()), fieldDst.Elem())
 		}
 		v.Set(m)
 	default:
-		err := d.br.UnreadByte()
-		if err != nil {
-			return err
-		}
-		err = d.skipValue()
-		if err != nil {
-			return errors.Join(ErrTypeMismatch, err)
-		}
-		return ErrTypeMismatch
+		return &TypeError{Offset: d.offset(), Value: "dict", Type: t, cause: ErrTypeMismatch}
 	}
 
 	return nil
@@ -212,7 +281,7 @@ func buildFields(t reflect.Type) map[string]int {
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		if !field.IsExported() && !field.Anonymous {
+		if !field.IsExported() {
 			continue
 		}
 
@@ -260,8 +329,9 @@ func resolveCandidates(cs []fieldCandidate) (fieldCandidate, bool) {
 }
 
 func (d *Decoder) decodeList(v reflect.Value) error {
+	t := v.Type()
 	if !v.CanSet() {
-		return ErrInvalidDestination
+		return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: ErrInvalidDestination}
 	}
 	switch k := v.Kind(); k {
 	case reflect.Slice, reflect.Interface:
@@ -276,9 +346,9 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 			lb, err := d.br.ReadByte()
 			if err != nil {
 				if errors.Is(err, io.EOF) {
-					return io.ErrUnexpectedEOF
+					err = io.ErrUnexpectedEOF
 				}
-				return err
+				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
 			}
 			if lb == 'e' {
 				break
@@ -286,13 +356,13 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 
 			err = d.br.UnreadByte()
 			if err != nil {
-				return err
+				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
 			}
 
 			elem := reflect.New(t.Elem())
 			err = d.decode(elem.Elem())
 			if err != nil {
-				return err
+				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
 			}
 
 			s = reflect.Append(s, elem.Elem())
@@ -307,21 +377,21 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 			lb, err := d.br.ReadByte()
 			if err != nil {
 				if errors.Is(err, io.EOF) {
-					return io.ErrUnexpectedEOF
+					err = io.ErrUnexpectedEOF
 				}
-				return err
+				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
 			}
 			if lb == 'e' {
 				break
 			}
 			err = d.br.UnreadByte()
 			if err != nil {
-				return err
+				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
 			}
 			if i >= v.Len() {
 				err = d.skipValue()
 				if err != nil {
-					return err
+					return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
 				}
 				continue
 			}
@@ -329,7 +399,7 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 			elem := reflect.New(v.Type().Elem())
 			err = d.decode(elem.Elem())
 			if err != nil {
-				return err
+				return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: err}
 			}
 
 			s.Index(i).Set(elem.Elem())
@@ -338,91 +408,85 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 
 		v.Set(s)
 	default:
-		err := d.br.UnreadByte()
-		if err != nil {
-			return err
-		}
-		err = d.skipValue()
-		if err != nil {
-			return errors.Join(ErrTypeMismatch, err)
-		}
-		return ErrTypeMismatch
+		return &TypeError{Offset: d.offset(), Value: "list", Type: t, cause: ErrTypeMismatch}
 	}
 	return nil
 }
 func (d *Decoder) decodeInt(v reflect.Value) error {
+	t := v.Type()
 	if !v.CanSet() {
-		return ErrInvalidDestination
+		return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrInvalidDestination}
 	}
 
 	iStr, err := d.readInt()
 	if err != nil {
-		return err
+		return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: err}
 	}
 
 	switch k := v.Kind(); k {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		iInt, err := strconv.ParseInt(iStr, 10, 64)
 		if err != nil {
-			return ErrOverflow
+			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		if v.OverflowInt(iInt) {
-			return ErrOverflow
+			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.SetInt(int64(iInt))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		iUint, err := strconv.ParseUint(iStr, 10, 64)
 		if err != nil {
-			return ErrOverflow
+			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		if v.OverflowUint(iUint) {
-			return ErrOverflow
+			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.SetUint(uint64(iUint))
 	case reflect.Float32, reflect.Float64:
 		iFloat, err := strconv.ParseFloat(iStr, 64)
 		if err != nil {
-			return ErrOverflow
+			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		if v.OverflowFloat(iFloat) {
-			return ErrOverflow
+			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.SetFloat(iFloat)
 	case reflect.Interface:
 		iInt, err := strconv.ParseInt(iStr, 10, 64)
 		if err != nil {
-			return ErrOverflow
+			return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrOverflow}
 		}
 		v.Set(reflect.ValueOf(int64(iInt)))
 	case reflect.Bool:
 		v.SetBool(iStr != "0")
 	default:
-		return ErrTypeMismatch
+		return &TypeError{Offset: d.offset(), Value: "integer", Type: t, cause: ErrTypeMismatch}
 	}
 	return nil
 }
 func (d *Decoder) decodeString(v reflect.Value) error {
+	t := v.Type()
 	err := d.br.UnreadByte()
 	if err != nil {
-		return err
+		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: err}
 	}
 
 	if !v.CanSet() {
-		return ErrInvalidDestination
+		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: ErrInvalidDestination}
 	}
 
 	lengthInt, err := d.readStrLen()
 	if err != nil {
-		return err
+		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: err}
 	}
 
 	str := make([]byte, lengthInt)
 	_, err = io.ReadFull(d.br, str)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return io.ErrUnexpectedEOF
+			err = io.ErrUnexpectedEOF
 		}
-		return err
+		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: err}
 	}
 
 	switch k := v.Kind(); {
@@ -432,14 +496,14 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 		v.SetBytes(str)
 	case k == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8:
 		if v.Len() != len(str) {
-			return ErrTypeMismatch
+			return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: ErrArrayLength}
 		}
 
 		reflect.Copy(v, reflect.ValueOf(str))
 	case k == reflect.Interface:
 		v.Set(reflect.ValueOf(string(str)))
 	default:
-		return ErrTypeMismatch
+		return &TypeError{Offset: d.offset(), Value: "string", Type: t, cause: ErrTypeMismatch}
 	}
 
 	return nil
@@ -448,8 +512,13 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 func (d *Decoder) skipValue() error {
 	d.depth++
 	defer func() { d.depth-- }()
-	if d.depth >= MaxRecurtionDepth {
-		return ErrMaxDepth
+	if d.depth >= DefaultMaxRecursionDepth {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxDepth",
+			Value:  int64(d.Limits.MaxDepth),
+			cause:  ErrMaxDepth,
+		}
 	}
 
 	b, err := d.br.ReadByte()
@@ -475,6 +544,9 @@ func (d *Decoder) skipDictList() error {
 	for {
 		lb, err := d.br.ReadByte()
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
 			return err
 		}
 		if lb == 'e' {
@@ -515,7 +587,7 @@ func (d *Decoder) skipString() error {
 		return err
 	}
 
-	_, err = d.discard(lengthInt)
+	_, err = d.br.Discard(lengthInt)
 	if err != nil {
 		return err
 	}
@@ -523,25 +595,14 @@ func (d *Decoder) skipString() error {
 	return nil
 }
 
-func (d *Decoder) discard(n int) (int, error) {
-	if n < 0 {
-		return 0, bufio.ErrNegativeCount
-	}
-	if dr, ok := d.br.(discarder); ok {
-		return dr.Discard(n)
-	}
-	m, err := io.CopyN(io.Discard, d.br, int64(n))
-	return int(m), err
-}
-
-func (d *Decoder) readIntSlice(delim byte, limit int) ([]byte, error) {
+func (d *Decoder) readIntSlice(delim byte) ([]byte, error) {
 	var buf []byte
-	n := 0
+	var n int64
 	for {
 		b, err := d.br.ReadByte()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil, io.ErrUnexpectedEOF
+				err = io.ErrUnexpectedEOF
 			}
 			return nil, err
 		}
@@ -549,53 +610,74 @@ func (d *Decoder) readIntSlice(delim byte, limit int) ([]byte, error) {
 			break
 		}
 		if (b < '0' || b > '9') && (b != '-' || n != 0) {
-			return nil, ErrSyntax
+			return nil, &SyntaxError{
+				Offset: d.offset(),
+				msg:    fmt.Sprintf("must be digit or `-`, got: %q", b),
+				cause:  ErrSyntax,
+			}
 		}
-		if n == limit {
-			return nil, ErrExceedsMax
+		if n > maxInt64Digits {
+			return nil, &SyntaxError{
+				Offset: d.offset(),
+				msg:    fmt.Sprintf("integer can only hold %d digits", maxInt64Digits),
+				cause:  ErrExceedsMax,
+			}
 		}
 		buf = append(buf, b)
 		n++
 	}
 	if n == 0 {
-		return nil, ErrEmpty
+		return nil, &SyntaxError{Offset: d.offset(), msg: "can't be empty", cause: ErrEmpty}
 	}
 	if n == 1 && buf[0] == '-' {
-		return nil, ErrSyntax
+		return nil, &SyntaxError{Offset: d.offset(), msg: "no digits after '-'", cause: ErrSyntax}
 	}
 
 	return buf, nil
 }
 
 func (d *Decoder) readStrLen() (int, error) {
-	buf, err := d.readIntSlice(':', MaxStringLenDigits)
+	buf, err := d.readIntSlice(':')
 	if err != nil {
 		return 0, err
 	}
 	if buf[0] == '0' && len(buf) > 1 {
-		return 0, ErrLeadingZero
+		return 0, &SyntaxError{
+			Offset: d.offset(),
+			msg:    "leading zero is forbidden",
+			cause:  ErrLeadingZero,
+		}
 	}
 	if buf[0] == '-' {
-		return 0, ErrSyntax
+		return 0, &SyntaxError{
+			Offset: d.offset(),
+			msg:    "leading `-` is forbidden for string length",
+			cause:  ErrSyntax,
+		}
 	}
 	return strconv.Atoi(string(buf))
 }
 
 func (d *Decoder) readInt() (string, error) {
-	buf, err := d.readIntSlice('e', MaxIntDigits)
+	buf, err := d.readIntSlice('e')
 	if err != nil {
-		if errors.Is(err, ErrExceedsMax) {
-			return "", ErrOverflow
-		}
 		return "", err
 	}
 	bufLen := len(buf)
 
 	if buf[0] == '0' && bufLen > 1 {
-		return "", ErrLeadingZero
+		return "", &SyntaxError{
+			Offset: d.offset(),
+			msg:    "leading zero is forbidden",
+			cause:  ErrLeadingZero,
+		}
 	}
 	if buf[0] == '-' && bufLen > 1 && buf[1] == '0' {
-		return "", ErrNegativeZero
+		return "", &SyntaxError{
+			Offset: d.offset(),
+			msg:    "negavie zero is forbidden",
+			cause:  ErrNegativeZero,
+		}
 	}
 	return string(buf), nil
 }
@@ -604,7 +686,7 @@ func (d *Decoder) readDictKey() ([]byte, bool, error) {
 	b, err := d.br.ReadByte()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, false, io.ErrUnexpectedEOF
+			err = io.ErrUnexpectedEOF
 		}
 		return nil, false, err
 	}
@@ -612,7 +694,11 @@ func (d *Decoder) readDictKey() ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	if b < '0' || b > '9' {
-		return nil, false, fmt.Errorf("%w: dict key must be a string, got %q", ErrSyntax, b)
+		return nil, false, &SyntaxError{
+			Offset: d.offset(),
+			msg:    fmt.Sprintf("dict key must be a string, got %q", b),
+			cause:  ErrSyntax,
+		}
 	}
 	err = d.br.UnreadByte()
 	if err != nil {
@@ -627,7 +713,7 @@ func (d *Decoder) readDictKey() ([]byte, bool, error) {
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(d.br, buf); err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, false, io.ErrUnexpectedEOF
+			err = io.ErrUnexpectedEOF
 		}
 		return nil, false, err
 	}
@@ -635,64 +721,107 @@ func (d *Decoder) readDictKey() ([]byte, bool, error) {
 	return buf, true, nil
 }
 
-func (d *Decoder) readRawValue() ([]byte, error) {
-	return nil, nil
-}
-
 func (d *Decoder) error(err error) error {
-	if !errors.Is(err, io.EOF) {
-		d.err = err
+	if errors.Is(err, errCaptureTooLarge) {
+		err = &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxCaptureBytes",
+			Value:  d.Limits.MaxCaptureBytes,
+			cause:  ErrExceedsMax,
+		}
 	}
+	d.err = err
 	return err
 }
 
-func getTag(tag string) (string, bool) {
-	if len(tag) == 0 {
-		return "", true
+func (d *Decoder) decodeRawValue(v reflect.Value) error {
+	startOffset := d.offset()
+	d.startRecorder(startOffset)
+	defer d.rec.resetBuf()
+	defer d.rec.off()
+
+	err := d.skipValue()
+	if err != nil {
+		return &TypeError{Offset: d.offset(), Type: rawMessageType, cause: err}
 	}
-	opts := splitTag(tag)
-	if opts[0] == "-" && len(tag) == 1 {
-		return "", false
+	endOffset := d.offset()
+	raw, err := d.rec.getBuf(startOffset, endOffset)
+	if err != nil {
+		return &TypeError{Offset: d.offset(), Type: rawMessageType, cause: err}
 	}
-	return opts[0], true
+	v.SetBytes(slices.Clone(raw))
+	return nil
 }
 
-func splitTag(tag string) []string {
-	if len(tag) == 0 {
-		return nil
-	}
-
-	c := count(tag, ',')
-	if c == 0 {
-		return []string{tag}
-	}
-
-	s := make([]string, 0, c)
-	var n, m int
-	for n <= len(tag) {
-		if n == len(tag) || tag[n] == ',' {
-			s = append(s, tag[m:n])
-			m = n + 1
-		}
-
-		n++
-	}
-	return s
+func (d *Decoder) offset() int64 {
+	return d.rec.pulled - int64(d.br.Buffered())
 }
 
-func count(s string, ch byte) int {
-	if len(s) == 0 || ch == 0 {
-		return 0
-	}
+// startRecorder must be called only on a value boundary, before the first byte is read
+//
+// it uses [bufio.Reader.Peek] which prevents a [bufio.Reader.UnreadByte] or [bufio.Reader.UnreadRune] call from succeeding
+func (d *Decoder) startRecorder(start int64) {
+	// ignore err because it won't return error, because we are peeking data only from buffer and not going over to trigger fill()
+	p, _ := d.br.Peek(d.br.Buffered())
+	// seed recorder's buf with decoder's, because some data might be in buffer which got there before recorder is turned on
+	d.rec.appendBuf(p)
+	d.rec.setBase(start)
+	d.rec.on(d.Limits.MaxCaptureBytes)
+}
 
-	count := 0
-	for n := 0; n < len(s); n++ {
-		if s[n] == ch {
-			count++
+type recorder struct {
+	src    io.Reader
+	pulled int64
+	buf    []byte
+	// base acts as offset for buf[0] => (when rec on) data[start:end] = buf[start-base : end-base]
+	// data[7:26] in rec buf might look like buf[0:19]
+	base int64
+	isOn bool
+	max  int64
+}
+
+func (r *recorder) on(max int64) { r.isOn, r.max = true, max }
+func (r *recorder) off()         { r.isOn = false }
+
+func (r *recorder) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	if r.isOn && n > 0 {
+		if int64(len(r.buf))+int64(n) > r.max {
+			return n, errCaptureTooLarge
 		}
+		r.buf = append(r.buf, p[:n]...)
 	}
+	r.pulled += int64(n)
+	return n, err
+}
 
-	return count
+func (r *recorder) getBuf(start, end int64) ([]byte, error) {
+	if end < start {
+		return nil, fmt.Errorf("%w: end must be more that start", ErrInternal)
+	}
+	if start < r.base {
+		return nil, fmt.Errorf("%w: start must be more or equal to r.base", ErrInternal)
+	}
+	if int64(len(r.buf)) < end-r.base {
+		return nil, fmt.Errorf("%w: end is out-of-bounds", ErrInternal)
+	}
+	return r.buf[start-r.base : end-r.base], nil
+}
+
+func (r *recorder) appendBuf(data []byte) {
+	r.buf = append(r.buf, data...)
+}
+
+func (r *recorder) setBase(newBase int64) {
+	r.base = newBase
+}
+
+func (r *recorder) resetBuf() {
+	if cap(r.buf) > maxRecBufRetained {
+		r.buf = nil
+	} else {
+		r.buf = r.buf[:0]
+	}
 }
 
 func indirect(v reflect.Value) reflect.Value {
