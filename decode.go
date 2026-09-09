@@ -53,7 +53,7 @@ type RawMessage []byte
 
 var rawMessageType = reflect.TypeFor[RawMessage]()
 
-var fieldCache sync.Map // key: field idx
+var fieldCache sync.Map // tag: 'field idx'
 
 type SyntaxError struct {
 	Offset int64
