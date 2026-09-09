@@ -780,6 +780,22 @@ func (d *Decoder) readDictKey() ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	if d.offset()-d.startOff+int64(n) > d.Limits.MaxValueBytes {
+		return nil, false, &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxValueBytes",
+			Value:  d.offset() + int64(n),
+			cause:  ErrExceedsMax,
+		}
+	}
+	if int64(n) > d.Limits.MaxStringBytes {
+		return nil, false, &LimitError{
+			Offset: d.off,
+			Limit:  "MaxStringBytes",
+			Value:  int64(n),
+			cause:  ErrExceedsMax,
+		}
+	}
 
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(d.br, buf); err != nil {
