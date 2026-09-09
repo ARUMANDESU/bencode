@@ -256,7 +256,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 			}
 
 			if err := d.decode(v.Field(idx)); err != nil {
-				if tErr, ok := errors.AsType[*TypeError](err); ok {
+				if tErr, ok := errors.AsType[*TypeError](err); ok && tErr.Field == "" {
 					tErr.Struct = t.Name()
 					tErr.Field = t.Field(idx).Name
 				}
