@@ -592,6 +592,9 @@ func (d *Decoder) skipValue() error {
 
 	b, err := d.br.ReadByte()
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return err
 	}
 
@@ -670,6 +673,9 @@ func (d *Decoder) skipString() error {
 
 	_, err = d.br.Discard(lengthInt)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return err
 	}
 
