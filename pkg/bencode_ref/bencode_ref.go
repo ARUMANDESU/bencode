@@ -374,8 +374,9 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 			t = reflect.TypeFor[[]any]()
 		}
 
-		s := reflect.MakeSlice(t, 0, 1)
+		s := reflect.New(t).Elem()
 
+		i := 0
 		for {
 			lb, err := d.br.ReadByte()
 			if err != nil {
@@ -393,15 +394,26 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 				return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
 			}
 
-			elem := reflect.New(t.Elem())
-			err = d.decode(elem.Elem())
-			if err != nil {
-				return err
+			if i >= s.Cap() {
+				newCap := max(s.Cap()+s.Cap()/2, 4)
+				grown := reflect.MakeSlice(t, s.Len(), newCap)
+				reflect.Copy(grown, s)
+				s.Set(grown)
+			}
+			if i >= s.Len() {
+				s.SetLen(i + 1)
 			}
 
-			s = reflect.Append(s, elem.Elem())
+			if err := d.decode(s.Index(i)); err != nil {
+				return err
+			}
+			i++
 		}
 
+		s.SetLen(i)
+		if i == 0 {
+			s.Set(reflect.MakeSlice(t, 0, 0)) // non-nil empty slice
+		}
 		v.Set(s)
 	case reflect.Array:
 		s := reflect.New(reflect.ArrayOf(v.Len(), v.Type().Elem())).Elem()
