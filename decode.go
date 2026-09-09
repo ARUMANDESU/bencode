@@ -670,6 +670,14 @@ func (d *Decoder) skipString() error {
 			cause:  ErrExceedsMax,
 		}
 	}
+	if int64(lengthInt) > d.Limits.MaxStringBytes {
+		return &LimitError{
+			Offset: d.off,
+			Limit:  "MaxStringBytes",
+			Value:  int64(lengthInt),
+			cause:  ErrExceedsMax,
+		}
+	}
 
 	_, err = d.br.Discard(lengthInt)
 	if err != nil {
