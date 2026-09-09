@@ -753,7 +753,16 @@ func (d *Decoder) readStrLen() (int, error) {
 			cause:  ErrSyntax,
 		}
 	}
-	return strconv.Atoi(string(buf))
+	i, err := strconv.Atoi(string(buf))
+	if err != nil {
+		return 0, &SyntaxError{
+			Offset: d.off,
+			msg:    "int overflow",
+			cause:  ErrOverflow,
+		}
+	}
+
+	return i, nil
 }
 
 func (d *Decoder) readInt() (string, error) {
