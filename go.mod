@@ -1,4 +1,4 @@
-module github.com/ARUMANDESU/gotorrent
+module github.com/ARUMANDESU/bencode
 
 go 1.26.1
 

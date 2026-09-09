@@ -1,4 +1,4 @@
-package bencoderef
+package bencode
 
 import (
 	"bufio"

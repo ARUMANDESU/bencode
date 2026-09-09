@@ -1,4 +1,4 @@
-package bencoderef
+package bencode
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	bencodeast "github.com/ARUMANDESU/gotorrent/pkg/bencode_ast"
+	bencodeast "github.com/ARUMANDESU/bencode/pkg/bencode_ast"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -2434,7 +2434,7 @@ type torrentMeta struct {
 func TestDecode_RealTorrent(t *testing.T) {
 	t.Parallel()
 
-	matches, err := filepath.Glob(filepath.Join("..", "..", "testdata", "*.torrent"))
+	matches, err := filepath.Glob(filepath.Join("testdata", "*.torrent"))
 	require.NoError(t, err)
 	require.NotEmpty(t, matches, "no .torrent file found in testdata")
 
