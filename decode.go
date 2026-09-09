@@ -112,6 +112,7 @@ type Decoder struct {
 	err      error
 	off      int64 // snapshotted offset
 	startOff int64
+	intBuf   [maxIntBytes]byte // one buffer for reading int -> no buffer slice alloc every time
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -675,9 +676,11 @@ func (d *Decoder) skipString() error {
 	return nil
 }
 
+// readIntSlice reads int from reader byte by byte
+//
+// note: returned slice aliases [Decoder.intBuf]
 func (d *Decoder) readIntSlice(delim byte) ([]byte, error) {
-	var buf []byte
-	var n int64
+	buf := d.intBuf[:0]
 	for {
 		b, err := d.br.ReadByte()
 		if err != nil {
@@ -689,28 +692,28 @@ func (d *Decoder) readIntSlice(delim byte) ([]byte, error) {
 		if b == delim {
 			break
 		}
-		if (b < '0' || b > '9') && (b != '-' || n != 0) {
+		bl := len(buf)
+		if (b < '0' || b > '9') && (b != '-' || bl != 0) {
 			return nil, &SyntaxError{
 				Offset: d.off,
 				msg:    fmt.Sprintf("must be digit or `-`, got: %q", b),
 				cause:  ErrSyntax,
 			}
 		}
-		if n >= maxIntBytes {
+		if bl >= cap(buf) {
 			return nil, &LimitError{
 				Offset: d.off,
 				Limit:  "maxInt64Digits",
-				Value:  n,
+				Value:  int64(bl),
 				cause:  ErrExceedsMax,
 			}
 		}
 		buf = append(buf, b)
-		n++
 	}
-	if n == 0 {
+	if len(buf) == 0 {
 		return nil, &SyntaxError{Offset: d.off, msg: "can't be empty", cause: ErrEmpty}
 	}
-	if n == 1 && buf[0] == '-' {
+	if len(buf) == 1 && buf[0] == '-' {
 		return nil, &SyntaxError{Offset: d.off, msg: "no digits after '-'", cause: ErrSyntax}
 	}
 
