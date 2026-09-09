@@ -23,13 +23,12 @@ const (
 
 const (
 	maxRecBufRetained = 64 << 10
-	maxIntBytes       = 21
+	maxIntegerDigits  = 21
 )
 
 var (
-	ErrInternal        = errors.New("internal error")
-	ErrUnsupportedType = errors.New("unsupported type")
-	ErrSyntax          = errors.New("syntax error")
+	ErrInternal = errors.New("internal error")
+	ErrSyntax   = errors.New("syntax error")
 
 	ErrLeadingZero  = fmt.Errorf("%w: leading zero", ErrSyntax)
 	ErrNegativeZero = fmt.Errorf("%w: negative zero", ErrSyntax)
@@ -112,7 +111,7 @@ type Decoder struct {
 	err      error
 	off      int64 // snapshotted offset
 	startOff int64
-	intBuf   [maxIntBytes]byte // one buffer for reading int -> no buffer slice alloc every time
+	intBuf   [maxIntegerDigits]byte // one buffer for reading int -> no buffer slice alloc every time
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -717,7 +716,7 @@ func (d *Decoder) readIntSlice(delim byte) ([]byte, error) {
 		if bl >= cap(buf) {
 			return nil, &LimitError{
 				Offset: d.off,
-				Limit:  "maxInt64Digits",
+				Limit:  "MaxIntegerDigits",
 				Value:  int64(bl),
 				cause:  ErrExceedsMax,
 			}
