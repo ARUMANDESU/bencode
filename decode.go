@@ -928,13 +928,13 @@ func (r *recorder) off()         { r.isOn = false }
 
 func (r *recorder) Read(p []byte) (int, error) {
 	n, err := r.src.Read(p)
+	r.pulled += int64(n)
 	if r.isOn && n > 0 {
 		if int64(len(r.buf))+int64(n) > r.max {
 			return n, errCaptureTooLarge
 		}
 		r.buf = append(r.buf, p[:n]...)
 	}
-	r.pulled += int64(n)
 	return n, err
 }
 
