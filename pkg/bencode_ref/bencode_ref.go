@@ -23,7 +23,7 @@ const (
 
 const (
 	maxRecBufRetained = 64 << 10
-	maxInt64Digits    = 20
+	maxIntBytes       = 21
 )
 
 var (
@@ -529,13 +529,12 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 		}
 	}
 	if int64(lengthInt) > d.Limits.MaxStringBytes {
-		err := &LimitError{
+		return &LimitError{
 			Offset: d.off,
 			Limit:  "MaxStringBytes",
 			Value:  int64(lengthInt),
 			cause:  ErrExceedsMax,
 		}
-		return &TypeError{Offset: d.off, Value: "string", Type: t, cause: err}
 	}
 
 	str := make([]byte, lengthInt)
@@ -605,7 +604,11 @@ func (d *Decoder) skipValue() error {
 	case b >= '0' && b <= '9':
 		return d.skipString()
 	default:
-		return fmt.Errorf("%w: unexpected %q", ErrSyntax, b)
+		return &SyntaxError{
+			Offset: d.off,
+			msg:    fmt.Sprintf("unexpected: %q", b),
+			cause:  ErrSyntax,
+		}
 	}
 }
 
@@ -693,10 +696,11 @@ func (d *Decoder) readIntSlice(delim byte) ([]byte, error) {
 				cause:  ErrSyntax,
 			}
 		}
-		if n > maxInt64Digits {
-			return nil, &SyntaxError{
+		if n >= maxIntBytes {
+			return nil, &LimitError{
 				Offset: d.off,
-				msg:    fmt.Sprintf("integer can only hold %d digits", maxInt64Digits),
+				Limit:  "maxInt64Digits",
+				Value:  n,
 				cause:  ErrExceedsMax,
 			}
 		}
