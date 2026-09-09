@@ -859,16 +859,16 @@ func (d *Decoder) error(err error) error {
 }
 
 func (d *Decoder) fixLimits() {
-	if d.Limits.MaxCaptureBytes == 0 {
+	if d.Limits.MaxCaptureBytes <= 0 {
 		d.Limits.MaxCaptureBytes = DefaultMaxCaptureBytes
 	}
-	if d.Limits.MaxDepth == 0 {
+	if d.Limits.MaxDepth <= 0 {
 		d.Limits.MaxDepth = DefaultMaxRecursionDepth
 	}
-	if d.Limits.MaxStringBytes == 0 {
+	if d.Limits.MaxStringBytes <= 0 {
 		d.Limits.MaxStringBytes = DefaultMaxStringBytes
 	}
-	if d.Limits.MaxValueBytes == 0 {
+	if d.Limits.MaxValueBytes <= 0 {
 		d.Limits.MaxValueBytes = DefaultMaxValueBytes
 	}
 }
