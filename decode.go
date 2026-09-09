@@ -557,7 +557,7 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 			return &TypeError{Offset: d.off, Value: "string", Type: t, cause: ErrArrayLength}
 		}
 
-		reflect.Copy(v, reflect.ValueOf(str))
+		reflect.Copy(v, reflect.ValueOf(str).Convert(t))
 	case k == reflect.Interface:
 		v.Set(reflect.ValueOf(string(str)))
 	default:
