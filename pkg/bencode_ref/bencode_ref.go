@@ -54,7 +54,7 @@ type RawMessage []byte
 
 var rawMessageType = reflect.TypeFor[RawMessage]()
 
-var fieldCache sync.Map
+var fieldCache sync.Map // key: field idx
 
 type SyntaxError struct {
 	Offset int64
@@ -130,7 +130,7 @@ func NewDecoder(r io.Reader) *Decoder {
 }
 
 func Unmarshal(b []byte, v any) error {
-	d := NewDecoder(bytes.NewBuffer(b))
+	d := NewDecoder(bytes.NewReader(b))
 	err := d.Decode(v)
 	if err != nil {
 		return err
@@ -756,7 +756,7 @@ func (d *Decoder) readInt() (string, error) {
 	if buf[0] == '-' && bufLen > 1 && buf[1] == '0' {
 		return "", &SyntaxError{
 			Offset: d.off,
-			msg:    "negavie zero is forbidden",
+			msg:    "negative zero is forbidden",
 			cause:  ErrNegativeZero,
 		}
 	}
@@ -912,7 +912,7 @@ func (r *recorder) Read(p []byte) (int, error) {
 
 func (r *recorder) getBuf(start, end int64) ([]byte, error) {
 	if end < start {
-		return nil, fmt.Errorf("%w: end must be more that start", ErrInternal)
+		return nil, fmt.Errorf("%w: end must be more than start", ErrInternal)
 	}
 	if start < r.base {
 		return nil, fmt.Errorf("%w: start must be more or equal to r.base", ErrInternal)
