@@ -165,7 +165,7 @@ Decoding into a non-zero destination:
 | destination | behaviour |
 |---|---|
 | slice | replaced, not appended |
-| array | replaced wholesale; elements past the input's length are zeroed |
+| array | replaced wholesale; §4 requires an exact length match, so every element is overwritten and no stale tail can survive |
 | map | replaced, not merged |
 | struct | fields present in the input are overwritten; **fields absent from the input are left as they were** |
 
@@ -213,7 +213,7 @@ list.
 | destination | behaviour |
 |---|---|
 | `[]T` | replaced; an empty list yields a **non-nil, empty** slice |
-| `[N]T` | fills `min(len, N)`; surplus elements are consumed and discarded; the tail is zeroed |
+| `[N]T` | list length must equal `N` **exactly**, else `ErrArrayLength` |
 | `any` | `[]any` |
 | `*T` | allocate, recurse |
 | `RawMessage` | verbatim bytes (§9) |
@@ -230,21 +230,23 @@ list.
 | `*T` | allocate, recurse |
 | `RawMessage` | verbatim bytes (§9) |
 
-### 4.1 Why arrays differ between strings and lists
+### 4.1 Why arrays are strict
 
-`[N]byte` from a string is strict; `[N]T` from a list truncates. The asymmetry
-is deliberate.
+Both array cases — `[N]byte` from a string, `[N]T` from a list — demand an
+exact length. This departs from `encoding/json`, which silently discards
+surplus list elements and zeroes the tail of a short one.
 
-An array destination for a string is almost always a fixed-width identifier —
-a SHA-1, a peer ID, an infohash. A partially filled one is not a degraded
-identifier, it is a *different* identifier that will compare unequal to the
-right one and produce a failure far from its cause. Rejecting is the only safe
-option.
+An array destination is a statement that the value has exactly `N` elements.
+For a string it is almost always a fixed-width identifier — a SHA-1, a peer ID,
+an infohash. A partially filled one is not a degraded identifier, it is a
+*different* identifier that will compare unequal to the right one and produce a
+failure far from its cause.
 
-An array destination for a list is a capacity choice by the caller: "give me at
-most N of these". Truncation is the expected reading, and it matches
-`encoding/json`, which discards surplus list elements into an array without
-complaint.
+The same reasoning carries to lists. A caller who wants "at most N of these"
+has `[]T` and can check `len` themselves; a caller who reaches for `[N]T` is
+asserting a shape, and a mismatch means the input is not what they think it is.
+Silent truncation converts that into a bug that surfaces later, somewhere else.
+Rejecting keeps the failure at the point where the assumption broke.
 
 ---
 
@@ -268,7 +270,7 @@ Sub-sentinels describe a more specific cause and wrap a sentinel above:
 | `ErrLeadingZero` | `ErrSyntax` | `i03e`, `03:abc` |
 | `ErrNegativeZero` | `ErrSyntax` | `i-0e` |
 | `ErrEmpty` | `ErrSyntax` | `ie`, `:abc` |
-| `ErrArrayLength` | `ErrTypeMismatch` | string length ≠ `[N]byte` length |
+| `ErrArrayLength` | `ErrTypeMismatch` | string length ≠ `[N]byte` length; list length ≠ `[N]T` length |
 
 So both of these hold:
 
@@ -790,6 +792,9 @@ Grouped by why they changed.
   for an ambiguous key. Now "present **and bound**".
 - **§4 `[N]byte` length mismatch** returned `ErrTypeMismatch`, though the type
   did match. Now `ErrArrayLength`, wrapping it.
+- **§4 `[N]T` from a list** truncated to `min(len, N)` and discarded surplus,
+  following `encoding/json`. Now strict like `[N]byte`: a length mismatch is
+  `ErrArrayLength`. §4.1 records why the two array cases are now symmetric.
 
 ### Gaps — draft 1 was silent where it should not have been
 

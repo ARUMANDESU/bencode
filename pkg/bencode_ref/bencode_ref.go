@@ -416,7 +416,7 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 		}
 		v.Set(s)
 	case reflect.Array:
-		s := reflect.New(reflect.ArrayOf(v.Len(), v.Type().Elem())).Elem()
+		s := reflect.New(v.Type()).Elem()
 
 		i := 0
 		for {
@@ -435,21 +435,16 @@ func (d *Decoder) decodeList(v reflect.Value) error {
 				return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
 			}
 			if i >= v.Len() {
-				err = d.skipValue()
-				if err != nil {
-					return &TypeError{Offset: d.off, Value: "list", Type: t, cause: err}
-				}
-				continue
+				return &TypeError{Offset: d.off, Value: "list", Type: t, cause: ErrArrayLength}
 			}
 
-			elem := reflect.New(v.Type().Elem())
-			err = d.decode(elem.Elem())
-			if err != nil {
+			if err := d.decode(s.Index(i)); err != nil {
 				return err
 			}
-
-			s.Index(i).Set(elem.Elem())
 			i++
+		}
+		if i < v.Len() {
+			return &TypeError{Offset: d.off, Value: "list", Type: t, cause: ErrArrayLength}
 		}
 
 		v.Set(s)

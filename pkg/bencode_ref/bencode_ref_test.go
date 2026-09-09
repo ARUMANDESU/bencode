@@ -823,15 +823,31 @@ func TestSpec3_4_Reuse(t *testing.T) {
 		assert.Equal(t, []string{"new"}, got)
 	})
 
-	// SPEC §3.4: an array is replaced wholesale and the tail is zeroed — a
-	// reused array must not show leftovers past the input's length.
-	t.Run("array tail is zeroed on reuse", func(t *testing.T) {
+	// SPEC §3.4: an array is replaced wholesale. §4 requires an exact length
+	// match, so every element is overwritten and no stale tail can survive —
+	// there is no partial-fill case left for reuse to expose.
+	t.Run("array is replaced wholesale on reuse", func(t *testing.T) {
 		t.Parallel()
-		input := mustEncode(t, bencodeast.List{bencodeast.Str("new")})
+		input := mustEncode(t, bencodeast.List{
+			bencodeast.Str("new1"), bencodeast.Str("new2"), bencodeast.Str("new3"),
+		})
 
 		got := [3]string{"old1", "old2", "old3"}
 		require.NoError(t, decode(t, input, &got))
-		assert.Equal(t, [3]string{"new", "", ""}, got)
+		assert.Equal(t, [3]string{"new1", "new2", "new3"}, got)
+	})
+
+	// A reused array that fails the length check must not be left holding a
+	// mix of new and stale elements — the decode is all or nothing.
+	t.Run("a rejected list leaves a reused array untouched", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.List{bencodeast.Str("new1")})
+
+		got := [3]string{"old1", "old2", "old3"}
+		err := decode(t, input, &got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrArrayLength)
+		assert.Equal(t, [3]string{"old1", "old2", "old3"}, got)
 	})
 
 	t.Run("map is replaced not merged", func(t *testing.T) {
@@ -974,10 +990,10 @@ func TestSpec4_StringDestinations(t *testing.T) {
 		assert.Equal(t, []byte(hash), got.Hash[:])
 	})
 
-	// SPEC §4.1: strings into arrays are strict where lists into arrays
-	// truncate, because an array destination for a string is almost always a
-	// fixed-width identifier. A partially filled SHA-1 is not a degraded
-	// hash — it is a different hash that compares unequal far from its cause.
+	// SPEC §4.1: an array destination is strict because it asserts a shape.
+	// For a string it is almost always a fixed-width identifier, and a
+	// partially filled SHA-1 is not a degraded hash — it is a different hash
+	// that compares unequal far from its cause.
 	t.Run("length must equal the array exactly", func(t *testing.T) {
 		t.Parallel()
 
@@ -1056,30 +1072,53 @@ func TestSpec4_ListDestinations(t *testing.T) {
 		assert.Equal(t, [3]string{"a", "b", "c"}, got)
 	})
 
-	t.Run("short list leaves the array tail zeroed", func(t *testing.T) {
+	// SPEC §4 + §4.1: a list into an array is strict in both directions, the
+	// same as a string into [N]byte. A caller who wants "at most N" has []T
+	// and can check len; reaching for [N]T asserts a shape, and a mismatch
+	// means the input is not what the caller thinks it is.
+	t.Run("length must equal the array exactly", func(t *testing.T) {
 		t.Parallel()
-		input := mustEncode(t, bencodeast.List{bencodeast.Str("a"), bencodeast.Str("b")})
 
-		var got [3]string
-		require.NoError(t, decode(t, input, &got))
-		assert.Equal(t, [3]string{"a", "b", ""}, got)
-	})
+		t.Run("shorter must not partially fill", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.List{bencodeast.Str("a"), bencodeast.Str("b")})
 
-	// SPEC §4.1: an array destination for a LIST is a capacity choice —
-	// "give me at most N" — so surplus is discarded, not rejected. It must
-	// still be consumed, or the next Decode reads the leftovers.
-	t.Run("surplus elements are consumed and discarded", func(t *testing.T) {
-		t.Parallel()
-		d := NewDecoder(strings.NewReader("l1:a1:b1:cei99e"))
+			var got [3]string
+			err := decode(t, input, &got)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrArrayLength, "the type matched; only the length did not")
+			assert.ErrorIs(t, err, ErrTypeMismatch, "must still classify as a mismatch")
+			assert.Equal(t, [3]string{}, got, "a rejected value must not have been written")
+		})
 
-		var arr [1]string
-		require.NoError(t, decodeWith(t, d, &arr))
-		assert.Equal(t, [1]string{"a"}, arr)
+		t.Run("longer is rejected too", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.List{
+				bencodeast.Str("a"), bencodeast.Str("b"), bencodeast.Str("c"),
+			})
 
-		var after int
-		require.NoError(t, decodeWith(t, d, &after),
-			"surplus elements must be consumed, not left in the stream")
-		assert.Equal(t, 99, after)
+			var got [2]string
+			err := decode(t, input, &got)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrArrayLength)
+			assert.ErrorIs(t, err, ErrTypeMismatch)
+			assert.Equal(t, [2]string{}, got, "a rejected value must not have been written")
+		})
+
+		// The old contract discarded surplus and required it to be consumed
+		// so the next Decode saw a clean stream. Rejecting makes that moot:
+		// §6 poisons the decoder, so there is no next value to protect.
+		t.Run("a surplus rejection poisons the decoder", func(t *testing.T) {
+			t.Parallel()
+			d := NewDecoder(strings.NewReader("l1:a1:b1:cei99e"))
+
+			var arr [1]string
+			require.Error(t, decodeWith(t, d, &arr))
+
+			var after int
+			assert.Error(t, decodeWith(t, d, &after),
+				"the decoder is poisoned; the trailing integer must not be readable")
+		})
 	})
 }
 
@@ -1300,7 +1339,9 @@ func TestSpec4_DestinationMatrix(t *testing.T) {
 
 		{"list", aList, []dstCase{
 			{"[]string", func() any { return new([]string) }, nil},
-			{"[2]string", func() any { return new([2]string) }, nil},
+			{"[1]string", func() any { return new([1]string) }, nil},
+			// aList holds one element, so the length check rejects this.
+			{"[2]string", func() any { return new([2]string) }, ErrArrayLength},
 			{"any", func() any { return new(any) }, nil},
 			{"*[]string", func() any { return new(*[]string) }, nil},
 			{"int", func() any { return new(int) }, ErrTypeMismatch},
@@ -1787,6 +1828,8 @@ func TestSpec6_1_EveryErrorPoisons(t *testing.T) {
 		{"string into int", "4:spam", func() any { return new(int) }},
 		{"nested dict into int", "d1:ad1:bl1:ceee", func() any { return new(int) }},
 		{"short string into byte array", "4:spam", func() any { return new([20]byte) }},
+		{"short list into array", "l1:a1:be", func() any { return new([3]string) }},
+		{"long list into array", "l1:a1:b1:ce", func() any { return new([1]string) }},
 		// This one exposed the contradiction inside draft 1: §4 required the
 		// non-string key type to be rejected BEFORE any entry was decoded,
 		// which leaves the stream just past the 'd' — while §6 claimed the
