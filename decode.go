@@ -901,7 +901,7 @@ func (d *Decoder) decodeRawValue(v reflect.Value) error {
 	defer func() { d.depth++ }() // compensate defer depth--
 	err = d.skipValue()
 	if err != nil {
-		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
+		return err
 	}
 	endOffset := d.offset()
 	raw, err := d.rec.getBuf(startOffset, endOffset)
