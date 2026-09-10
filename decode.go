@@ -888,6 +888,7 @@ func (d *Decoder) decodeRawValue(v reflect.Value) error {
 
 	// [Decoder.decode] increments depth, then [Decoder.skipValue] increments again, so decrement before calling latter
 	d.depth--
+	defer func() { d.depth++ }() // compensate defer depth--
 	err := d.skipValue()
 	if err != nil {
 		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
