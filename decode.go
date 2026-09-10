@@ -47,8 +47,6 @@ var (
 	ErrMaxDepth = errors.New("max nesting depth exceeded")
 )
 
-var errCaptureTooLarge = errors.New("capture limit exceeded")
-
 type RawMessage []byte
 
 var rawMessageType = reflect.TypeFor[RawMessage]()
@@ -105,13 +103,14 @@ type Limits struct {
 type Decoder struct {
 	Limits Limits
 
-	br       *bufio.Reader
-	rec      *recorder
-	depth    uint
-	err      error
-	off      int64 // snapshotted offset
-	startOff int64
-	intBuf   [maxIntegerDigits]byte // one buffer for reading int -> no buffer slice alloc every time
+	br              *bufio.Reader
+	rec             *recorder
+	depth           uint
+	err             error
+	off             int64 // snapshotted offset
+	startOff        int64
+	captureStartOff int64
+	intBuf          [maxIntegerDigits]byte // one buffer for reading int -> no buffer slice alloc every time
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -575,6 +574,14 @@ func (d *Decoder) skipValue() error {
 			cause:  ErrExceedsMax,
 		}
 	}
+	if d.rec.isOn && d.offset()-d.captureStartOff > d.Limits.MaxCaptureBytes {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxCaptureBytes",
+			Value:  d.Limits.MaxCaptureBytes,
+			cause:  ErrExceedsMax,
+		}
+	}
 
 	d.snapshotOffset()
 
@@ -666,6 +673,14 @@ func (d *Decoder) skipString() error {
 			Offset: d.offset(),
 			Limit:  "MaxValueBytes",
 			Value:  d.offset() + int64(lengthInt),
+			cause:  ErrExceedsMax,
+		}
+	}
+	if d.rec.isOn && d.offset()-d.captureStartOff+int64(lengthInt) > d.Limits.MaxCaptureBytes {
+		return &LimitError{
+			Offset: d.offset(),
+			Limit:  "MaxCaptureBytes",
+			Value:  d.Limits.MaxCaptureBytes,
 			cause:  ErrExceedsMax,
 		}
 	}
@@ -845,14 +860,6 @@ func (d *Decoder) readDictKey() ([]byte, bool, error) {
 }
 
 func (d *Decoder) error(err error) error {
-	if errors.Is(err, errCaptureTooLarge) {
-		err = &LimitError{
-			Offset: d.offset(),
-			Limit:  "MaxCaptureBytes",
-			Value:  d.Limits.MaxCaptureBytes,
-			cause:  ErrExceedsMax,
-		}
-	}
 	d.err = err
 	return err
 }
@@ -874,6 +881,7 @@ func (d *Decoder) fixLimits() {
 
 func (d *Decoder) decodeRawValue(v reflect.Value) error {
 	startOffset := d.offset()
+	d.captureStartOff = startOffset
 	d.startRecorder(startOffset)
 	defer d.rec.resetBuf()
 	defer d.rec.off()
@@ -908,7 +916,7 @@ func (d *Decoder) startRecorder(start int64) {
 	// seed recorder's buf with decoder's, because some data might be in buffer which got there before recorder is turned on
 	d.rec.appendBuf(p)
 	d.rec.setBase(start)
-	d.rec.on(d.Limits.MaxCaptureBytes)
+	d.rec.on()
 }
 
 type recorder struct {
@@ -919,19 +927,15 @@ type recorder struct {
 	// data[7:26] in rec buf might look like buf[0:19]
 	base int64
 	isOn bool
-	max  int64
 }
 
-func (r *recorder) on(max int64) { r.isOn, r.max = true, max }
-func (r *recorder) off()         { r.isOn = false }
+func (r *recorder) on()  { r.isOn = true }
+func (r *recorder) off() { r.isOn = false }
 
 func (r *recorder) Read(p []byte) (int, error) {
 	n, err := r.src.Read(p)
 	r.pulled += int64(n)
 	if r.isOn && n > 0 {
-		if int64(len(r.buf))+int64(n) > r.max {
-			return n, errCaptureTooLarge
-		}
 		r.buf = append(r.buf, p[:n]...)
 	}
 	return n, err
@@ -950,6 +954,12 @@ func (r *recorder) getBuf(start, end int64) ([]byte, error) {
 	return r.buf[start-r.base : end-r.base], nil
 }
 
+// appendBuf appends data into [recorder.buf]
+//
+// note: this currently only used for populating [recorder.buf]
+// with data from [bufio.Reader]'s buffer
+// that get there before turning on recorder,
+// thus I thought that it's ok not to check for [Limits.MaxCaptureBytes] here
 func (r *recorder) appendBuf(data []byte) {
 	r.buf = append(r.buf, data...)
 }
