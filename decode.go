@@ -880,6 +880,16 @@ func (d *Decoder) fixLimits() {
 }
 
 func (d *Decoder) decodeRawValue(v reflect.Value) error {
+	_, err := d.br.Peek(1) // §5.3
+	if err != nil {
+		isEOF := errors.Is(err, io.EOF)
+		if isEOF && d.depth > 1 {
+			return io.ErrUnexpectedEOF
+		} else if isEOF {
+			return err
+		}
+		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
+	}
 	startOffset := d.offset()
 	d.captureStartOff = startOffset
 	d.startRecorder(startOffset)
@@ -889,7 +899,7 @@ func (d *Decoder) decodeRawValue(v reflect.Value) error {
 	// [Decoder.decode] increments depth, then [Decoder.skipValue] increments again, so decrement before calling latter
 	d.depth--
 	defer func() { d.depth++ }() // compensate defer depth--
-	err := d.skipValue()
+	err = d.skipValue()
 	if err != nil {
 		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
 	}
