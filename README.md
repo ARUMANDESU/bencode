@@ -153,7 +153,26 @@ if errors.As(err, &te) {
 }
 ```
 
-Truncated input comes back as `io.ErrUnexpectedEOF`.
+The two ends of a stream are kept apart. A reader that runs out at a value boundary
+gives `io.EOF`, which is how a drain loop terminates; one that runs out part-way
+through a value gives `io.ErrUnexpectedEOF`, which is a broken file and not a
+stopping condition:
+
+```go
+for {
+	var t Torrent
+	err := d.Decode(&t)
+	if errors.Is(err, io.EOF) {
+		break
+	}
+	if err != nil {
+		return err
+	}
+	use(t)
+}
+```
+
+Once the decoder returns `io.EOF` it returns it forever, so the loop cannot spin.
 
 ## Status
 

@@ -452,8 +452,8 @@ digit count.
 type Limits struct {
     MaxStringBytes  int64 // single bencode string
     MaxValueBytes   int64 // one whole top-level value
-    MaxCaptureBytes int64 // §9.6 retention window
-    MaxDepth        int   // nesting
+    MaxCaptureBytes int64 // §9.6 capture span
+    MaxDepth        uint  // nesting
 }
 
 type Decoder struct {
@@ -467,12 +467,16 @@ is supported and well-defined; changing it during a call is not possible from
 a correct program (§10.1). A zero field means "use the default", so a partial
 override needs no constructor variant.
 
+`MaxDepth` is a `uint` because a negative nesting limit has no meaning: the
+only values it could carry are ones the decoder would have to reject, and a
+type that cannot express them is cheaper than a check that has to.
+
 | field | default | enforced |
 |---|---|---|
 | `MaxStringBytes` | 8 MiB | against the **declared** length, before any allocation |
 | `MaxValueBytes` | 16 MiB | total bytes consumed by the current top-level value, checked as it grows |
 | `MaxDepth` | 128 | on entry to each nested container |
-| `MaxCaptureBytes` | 8 MiB | on the §9.6 retention window, as it grows |
+| `MaxCaptureBytes` | 8 MiB | on `consumed - captureStart`, at the same chokepoints as `MaxValueBytes` (§9.6) |
 | `maxIntBytes` (internal, not configurable) | 64 | on the scan for the `e` terminator |
 
 ### 7.2 Rules
@@ -675,10 +679,13 @@ never downloads and a bug that takes a day to find.
 - **Retention window.** Recorded bytes are kept only from the start of the
   outermost active capture; everything earlier is discarded. Peak retention is
   the size of the value being captured, and is subject to `MaxCaptureBytes`
-  (§7.1).
+  (§7.1, enforced as §9.6.1 describes).
 - **Nesting is free.** Captures are `(start, end)` offset pairs into one
   window, not a stack of buffers, so an inner capture is a sub-range of the
-  outer one and no byte can be counted twice.
+  outer one and no byte can be counted twice. Note that the §9.3 walk never
+  decodes, so a capture cannot currently open inside another one: captures are
+  sequential in practice, and this bullet is a property of the design rather
+  than a case the decoder reaches.
 - **Recording is off by default.** With no `RawMessage` in the destination,
   nothing is retained. The offset counter still runs (§9.4).
 - **Single-reader invariant.** The correction in §9.4 holds only while the
@@ -687,7 +694,50 @@ never downloads and a bug that takes a day to find.
   what makes this invariant enforceable rather than merely requested.
 - **Errors.** A capture interrupted by an error is abandoned; there is nothing
   to unwind, because per §6.1 the decoder is poisoned and will produce no
-  further values.
+  further values. The walk's error is returned **as it stands** — it is not
+  re-wrapped as a `TypeError` against `RawMessage`. Per §9.1 every value is a
+  valid capture, so "this value does not fit this destination" is a category
+  that cannot arise here; a `TypeError` would name the destination for a fault
+  the destination did not have, carry an empty `Value` because there is no
+  offending value, and hide the `*SyntaxError` that holds the offending byte
+  and its offset (§5.2).
+- **Capture does not get its own EOF rules.** §5.3 is classified by position in
+  the input, not by destination: a stream that ends at a value boundary is
+  `io.EOF`, one that ends inside a container is `io.ErrUnexpectedEOF`. The
+  capture branch is entered *before* the type byte is read, so it bypasses the
+  classification the normal path applies and has to repeat it. Getting this
+  wrong reports a truncated file as a clean end of stream, and the caller's
+  drain loop (§5.3) then `break`s on corrupt input and swallows the error.
+
+### 9.6.1 Enforcing `MaxCaptureBytes`
+
+The limit is checked on the **offset span** of the active capture,
+`consumed - captureStart`, at the two chokepoints where `MaxValueBytes` is
+already checked: on entry to each value of the §9.3 walk, and — against the
+*declared* length, before any byte is pulled — in the string case. It is the
+same kind of check as `MaxValueBytes` with a different origin, and it is
+enforced entirely in the parser.
+
+**Rejected: returning the limit error from the recorder's `Read`.** Refusing to
+append past the limit and returning an error from the recorder looks like the
+tightest possible bound — the byte that would breach the window is the byte
+that fails. It does not work, for the same reason as §9.4: `bufio` sits between
+the recorder and the parser and owns that error, storing it and surfacing it
+only when its own buffer drains. A capture that completes from bytes already
+buffered never sees it. The failure is then not even a limit error: the parser
+finishes the walk, asks for a window the recorder declined to record, and gets
+an out-of-bounds internal error instead. Like §9.4, it fails as a function of
+source chunking, so it passes for byte-at-a-time inputs and fails for whole
+ones.
+
+The consequence of checking at chokepoints rather than at every append is
+**bounded slack**: between two checks the window can overrun the limit by at
+most the parser's read-ahead — one `bufio` refill — plus the prefix of one
+value. That overshoot is a constant, not a function of input length, which is
+all a DoS bound requires. The slack is deliberate, not an oversight: exactness
+would take an append-time check, and the paragraph above is why the recorder
+cannot be the thing that reports. Tightening the bound is not worth
+reintroducing an error path that fails by chunking.
 
 ### 9.7 Usage
 
