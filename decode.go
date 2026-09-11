@@ -76,9 +76,9 @@ type TypeError struct {
 func (e *TypeError) Unwrap() error { return e.cause }
 func (e *TypeError) Error() string {
 	if e.Struct != "" || e.Field != "" {
-		return "cannot unmarshal " + e.Value + " into Go struct field " + e.Struct + "." + e.Field + " of type " + e.Type.String()
+		return "cannot unmarshal " + e.Value + " into Go struct field " + e.Struct + "." + e.Field + " of type " + e.Type.String() + ": " + e.cause.Error()
 	}
-	return "cannot unmarshal " + e.Value + " into Go value of type " + e.Type.String()
+	return "cannot unmarshal " + e.Value + " into Go value of type " + e.Type.String() + ": " + e.cause.Error()
 }
 
 type LimitError struct {
