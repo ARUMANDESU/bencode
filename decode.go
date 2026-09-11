@@ -51,7 +51,7 @@ type RawMessage []byte
 
 var rawMessageType = reflect.TypeFor[RawMessage]()
 
-var fieldCache sync.Map // tag: 'field idx'
+var fieldCache sync.Map // tag: []'field idx'
 
 type SyntaxError struct {
 	Offset int64
@@ -245,7 +245,7 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				break
 			}
 
-			idx, ok := fields[string(key)]
+			idxs, ok := fields[string(key)]
 			if !ok {
 				err = d.skipValue()
 				if err != nil {
@@ -254,10 +254,18 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				continue
 			}
 
-			if err := d.decode(v.Field(idx)); err != nil {
-				if tErr, ok := errors.AsType[*TypeError](err); ok && tErr.Field == "" {
-					tErr.Struct = t.Name()
-					tErr.Field = t.Field(idx).Name
+			field, ft := v, t
+			for i, idx := range idxs {
+				field = indirect(field).Field(idx)
+				if i > 0 {
+					ft = indirectType(ft.Field(idx).Type)
+				}
+			}
+
+			if err := d.decode(field); err != nil {
+				if te, ok := errors.AsType[*TypeError](err); ok && te.Field == "" {
+					te.Struct = ft.Name()
+					te.Field = ft.Field(idxs[len(idxs)-1]).Name
 				}
 				return err
 			}
@@ -298,67 +306,112 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 
 type fieldCandidate struct {
 	isExplicit bool
-	index      int
+	indexes    []int
 }
 
-func cachedFields(t reflect.Type) map[string]int {
+func cachedFields(t reflect.Type) map[string][]int {
 	if f, ok := fieldCache.Load(t); ok {
-		return f.(map[string]int)
+		return f.(map[string][]int)
 	}
 	f, _ := fieldCache.LoadOrStore(t, buildFields(t))
-	return f.(map[string]int)
+	return f.(map[string][]int)
 }
 
-func buildFields(t reflect.Type) map[string]int {
+func buildFields(t reflect.Type) map[string][]int {
 	candidates := make(map[string][]fieldCandidate, t.NumField())
+	populateCandidates(t, nil, candidates, map[reflect.Type]struct{}{t: {}})
 
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if !field.IsExported() {
-			continue
-		}
-
-		name, isExplicit := field.Name, false
-		if raw, ok := field.Tag.Lookup(tagName); ok {
-			tag, _, hasOpts := strings.Cut(raw, ",")
-			if tag == "-" && !hasOpts {
-				continue
-			}
-			if tag != "" {
-				name, isExplicit = tag, true
-			}
-		}
-
-		candidates[name] = append(candidates[name], fieldCandidate{isExplicit, i})
-	}
-
-	fields := make(map[string]int, len(candidates))
+	fields := make(map[string][]int, len(candidates))
 	for name, cs := range candidates {
 		if winner, ok := resolveCandidates(cs); ok {
-			fields[name] = winner.index
+			fields[name] = winner.indexes
 		}
 	}
 
 	return fields
 }
 
+func populateCandidates(t reflect.Type, prevIdx []int, candidates map[string][]fieldCandidate, embedRecursionBan map[reflect.Type]struct{}) {
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() && !field.Anonymous {
+			continue
+		}
+
+		name, isExplicit, idxs := field.Name, false, append(prevIdx, i)
+		if raw, ok := field.Tag.Lookup(tagName); ok {
+			tag, _, hasOpts := strings.Cut(raw, ",")
+			if tag == "-" && !hasOpts {
+				continue
+			}
+			if field.Anonymous && !field.IsExported() {
+				continue
+			}
+			if tag != "" {
+				name, isExplicit = tag, true
+			}
+		} else if field.Anonymous {
+			if field.Type.Kind() == reflect.Pointer && !field.IsExported() {
+				continue
+			}
+			ft := indirectType(field.Type)
+			if _, ok := embedRecursionBan[ft]; ok {
+				continue
+			}
+
+			switch ft.Kind() {
+			case reflect.Struct:
+				embedRecursionBan[ft] = struct{}{}
+				// embedded struct fields lifting
+				populateCandidates(ft, idxs, candidates, embedRecursionBan)
+				delete(embedRecursionBan, ft)
+				continue
+			default:
+				if !field.IsExported() {
+					continue
+				}
+			}
+		}
+
+		candidates[name] = append(candidates[name], fieldCandidate{isExplicit, idxs})
+	}
+}
+
 func resolveCandidates(cs []fieldCandidate) (fieldCandidate, bool) {
-	if len(cs) == 1 {
-		return cs[0], true
+	if len(cs) == 0 {
+		return fieldCandidate{}, false
 	}
 
-	var winner fieldCandidate
-	explicit := 0
+	// rule 1: shallowest wins outright, tagged or not.
+	depth := len(cs[0].indexes)
+	for _, c := range cs[1:] {
+		depth = min(depth, len(c.indexes))
+	}
+
+	var shallowest, tagged fieldCandidate
+	tied, explicit := 0, 0
 	for _, c := range cs {
+		if len(c.indexes) != depth {
+			continue
+		}
+		tied++
+		shallowest = c
 		if c.isExplicit {
 			explicit++
-			winner = c
+			tagged = c
 		}
 	}
-	if explicit == 1 {
-		return winner, true
+
+	switch {
+	case tied == 1:
+		return shallowest, true
+	case explicit == 1:
+		// rule 2: exactly one tagged candidate breaks a same-depth tie.
+		return tagged, true
+	default:
+		// rule 3: zero or several tags at that depth -> binds to nothing.
+		return fieldCandidate{}, false
 	}
-	return fieldCandidate{}, false
 }
 
 func (d *Decoder) decodeList(v reflect.Value) error {
@@ -1000,6 +1053,17 @@ func indirect(v reflect.Value) reflect.Value {
 			v = v.Elem()
 		default:
 			return v
+		}
+	}
+}
+
+func indirectType(t reflect.Type) reflect.Type {
+	for {
+		switch t.Kind() {
+		case reflect.Pointer:
+			t = t.Elem()
+		default:
+			return t
 		}
 	}
 }
