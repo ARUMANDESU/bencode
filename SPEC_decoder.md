@@ -1,10 +1,11 @@
 # bencode_ref — decoder spec
 
-Status: draft 2. This document is the authority. Tests assert what is written
+Status: draft 3. This document is the authority. Tests assert what is written
 here; when behaviour and spec disagree, the spec wins and the code is the bug.
 Anything not stated here is undefined and must not be relied on.
 
-Appendix A lists what changed from draft 1 and why.
+Appendix A lists what changed from draft 1 and why; Appendix B does the same
+for draft 2 → 3, whose single subject is embedded field lifting (§3.3.1).
 
 ---
 
@@ -21,7 +22,6 @@ slice meant all of it. See §6.4.
 Non-goals for v1 (listed so their absence is a decision, not an oversight):
 
 - encoding
-- embedded / anonymous struct flattening
 - a custom `Unmarshaler` interface
 - `encoding.TextUnmarshaler` map keys
 - strict canonical-form validation
@@ -73,12 +73,21 @@ decoder every destination is, by construction, addressable and settable, so
 internal `CanSet` guards are assertions, not error paths.
 
 > **This invariant is not self-standing.** It holds only because §3.3 rule 1
-> keeps every unexported field out of the field map. Admitting any unexported
-> field — including an unexported *embedded* field, which is the easy mistake —
-> puts a read-only `reflect.Value` into the decode path, turns those assertions
-> into reachable code, and produces a panic in the container paths that call
-> `Set` on the whole value (§8). Rule 1 and this paragraph must be changed
-> together or not at all.
+> keeps every unexported field out of the field map *as a destination*, and
+> because §3.3.1 prunes the one traversal that would reach a read-only value
+> anyway. Binding a key to an unexported field puts a read-only
+> `reflect.Value` into the decode path, turns those assertions into reachable
+> code, and produces a panic in the container paths that call `Set` on the
+> whole value (§8).
+>
+> Since draft 3 the decoder *walks through* unexported embedded structs to
+> reach the exported fields inside them (§3.3.1), so "no unexported field is
+> ever touched" is no longer the mechanism. The precise mechanism is
+> `reflect`'s own distinction: the read-only marker an unexported **embedded**
+> field carries is not inherited by its fields, while the one an unexported
+> **named** field carries is. Only anonymous fields are ever descended into,
+> so every value the decoder binds is still settable. §3.3.1's prune list, §8's
+> table and this paragraph must be changed together or not at all.
 
 ### 3.2 Pointers
 
@@ -94,16 +103,34 @@ A key that is present but ambiguous (§3.3) binds to nothing and therefore
 allocates nothing. An absent key leaves the pointer untouched (nil in a fresh
 struct).
 
+**Embedded pointers are the one place a pointer becomes non-nil without a key
+of its own.** An embedded `*Base` is allocated when — and only when — some key
+binds to a field promoted out of it (§3.3.1). The rule above still holds if
+read as "the key that reached this pointer", one level down: no promoted key
+present means the embedded pointer stays nil.
+
 ### 3.3 Struct field mapping
 
-Field key resolution, in order:
+A struct type resolves to a map from **key** to **index path** — a `[]int`
+naming a field, possibly reached through one or more embedded structs (§3.3.1).
+For a plain struct every path has length 1.
 
-1. unexported → always skipped, tag or no tag, **including embedded fields**
-2. tag `bencode:"-"` (no comma) → skipped
-3. tag with a name → that name is the key, and the field counts as **tagged**
+Per-field key resolution, in order:
+
+1. unexported → skipped as a destination, tag or no tag. Unexported **embedded
+   struct** fields are the sole exception and are not destinations either: they
+   are *walked through* by §3.3.1, never bound to
+2. tag `bencode:"-"` (no comma) → skipped, and if the field is embedded its
+   contents are not lifted
+3. tag with a name → that name is the key, and the field counts as **tagged**.
+   This applies to embedded fields too, and a tagged embedded field is bound as
+   an ordinary field rather than lifted (§3.3.1)
 4. tag with an empty name (`bencode:",omitempty"`) → **Go field name**, exact,
-   and the field counts as **untagged** for §3.3.1
+   and the field counts as **untagged** for §3.3.2
 5. no tag at all → **Go field name**, exact, untagged
+
+An embedded field's "Go field name" is its type's name without package
+qualifier: embedded `bencode.RawMessage` is named `RawMessage`.
 
 Matching is **case-sensitive**, exact bytes. `"ip"` does not match field `IP`.
 
@@ -120,22 +147,113 @@ itself make a field tagged. Only a tag that supplies a *name* does. This
 matches `encoding/json`, where the dominance test is on the resolved name being
 non-empty, not on the tag's presence.
 
-#### 3.3.1 Competing fields
+#### 3.3.1 Embedded fields are lifted
+
+An **untagged embedded struct field is not a destination**; its fields are
+promoted into the parent's key space as if they had been declared there.
+
+```go
+type Common struct {
+    Announce string `bencode:"announce"`
+}
+
+type Torrent struct {
+    Common                  // lifted
+    Comment string `bencode:"comment"`
+}
+// keys: "announce" -> {0, 0}, "comment" -> {1}
+```
+
+This is what embedding means in Go — `t.Announce` compiles — and a decoder
+whose key space disagrees with the selector space makes shared field sets
+useless, which is the entire reason to embed.
+
+**What is lifted.** A field is walked into when it is anonymous, its type is a
+struct or a pointer to a struct, and it resolved to no explicit tag name
+(§3.3 rules 2–3). Everything else anonymous is an ordinary field, keyed and
+competing per §3.3:
+
+| anonymous field | treatment |
+|---|---|
+| `Common` (exported struct) | lifted |
+| `*Common` (exported pointer to struct) | lifted; allocated on demand (§3.2) |
+| `common` (unexported struct) | lifted — see below |
+| `*common` (unexported pointer to struct) | **pruned**: neither lifted nor bound |
+| `Common` with `bencode:"c"` | ordinary field, key `c`, tagged, **not** lifted |
+| `Common` with `bencode:"-"` | skipped entirely |
+| `MyInt` (exported, non-struct) | ordinary field, key `MyInt` |
+| `myInt` (unexported, non-struct) | skipped (§3.3 rule 1) |
+
+An untagged embedded struct therefore loses the key it had in draft 2 — `Common`
+above is no longer reachable under the key `Common`. Tag it to get that back.
+
+A **tagged unexported** embedded struct (`common` with `bencode:"c"`) is
+invisible: the tag asks for it to be bound, rule 1 forbids binding it, and
+asking for a key is not a request to lift. Nothing under it is reachable.
+Remove the tag to lift it, or export the type to bind it.
+
+**Unexported embedded structs are walked, not bound.** `reflect` marks the
+embedded field itself read-only but does **not** propagate that marker to its
+fields, so `T.common.Name` is settable even though `T.common` is not. Lifting
+out of an unexported struct is the standard mixin shape and `encoding/json`
+supports it, so it is supported here.
+
+`*common` is pruned for the mirror-image reason: reaching a field under it
+means allocating the pointer, and the pointer *is* read-only, so the `Set`
+would panic. The prune is done when the field map is built, not when a key
+arrives, which makes it a static property of the type rather than an error
+path that depends on the input. The keys underneath simply bind to nothing,
+exactly as an ambiguous key does (§3.3.2) — the same treatment for the same
+reason: the destination type is a programming error the decoder does not
+report. (`encoding/json` instead defers this to decode time and returns an
+error there; a build-time prune is cheaper, cacheable, and cannot desync a
+stream.)
+
+**The walk.** Keys are gathered breadth-first: all of depth 0, then all of
+depth 1, and so on. Breadth-first is what makes "shallowest wins" (§3.3.2)
+decidable without comparing every pair. A struct type is visited at most once
+per depth level, so recursive shapes (`type Node struct { *Node }`) terminate.
+
+The field-tree walk is a property of the destination *type*, not of the input.
+It is unrelated to `MaxDepth` (§7), which bounds nesting in the byte stream; no
+input can make this walk deeper.
+
+**Decoding through a path.** When a key binds to a path of length > 1, the
+decoder walks the path field by field, allocating any nil embedded pointer it
+passes through, then decodes into the leaf. Consequences:
+
+- a non-nil embedded pointer is reused, not replaced (§3.4)
+- allocation happens on the way to a value, so a value that then fails to
+  decode leaves the embedded pointer allocated. The decoder is poisoned
+  (§6.1), so this is not observable through any further `Decode`
+- the promoted field is the destination for §4 in every respect; embedding
+  changes which `reflect.Value` is reached, nothing about what may be stored
+  in it
+
+#### 3.3.2 Competing fields
 
 When two or more fields resolve to the same key, the winner is decided by these
 rules, in order — never by declaration order:
 
-1. If **exactly one** candidate is tagged, it wins, regardless of how many
-   untagged candidates it beats. Given `A string` tagged `"B"` alongside an
-   untagged field `B`, the key `B` binds to `A`.
-2. Otherwise — zero tagged candidates, or two or more — the key is **ambiguous
-   and binds to nothing**. No candidate is populated; the key is skipped
-   exactly as an unknown key is.
+1. **Shallowest wins.** A candidate with a shorter index path beats every
+   deeper one outright, tagged or not. A field declared on the struct itself
+   always beats one promoted out of an embedded struct — which is exactly what
+   Go does with the selector `t.Name`, and the reason an outer field is said to
+   *shadow* an inner one.
+2. Among the candidates tied at that shallowest depth: if **exactly one** is
+   tagged, it wins, regardless of how many untagged candidates it beats. Given
+   `A string` tagged `"B"` alongside an untagged field `B`, the key `B` binds
+   to `A`.
+3. Otherwise — zero tagged candidates at that depth, or two or more — the key
+   is **ambiguous and binds to nothing**. No candidate is populated; the key is
+   skipped exactly as an unknown key is.
 
-This is `encoding/json`'s `dominantField` minus its first rule (shallower
-embedding depth wins), which cannot apply here because embedded fields are not
-flattened — every field sits at depth 0. Add that rule ahead of these two if
-flattening is ever adopted.
+Two embedded structs both exposing `Name` are tied at depth 1 with no tag, so
+`Name` binds to neither — the decoder's echo of the compile error Go gives for
+the same selector. Tagging one of them resolves it, under rule 2.
+
+These are `encoding/json`'s `dominantField` rules, now including the depth rule
+draft 2 had to omit.
 
 Picking a winner by position was rejected. Go resolves ambiguity by declaration
 order nowhere: two embedded structs exposing the same field make the selector a
@@ -148,15 +266,16 @@ rebound one.
 
 An ambiguous key is a programming error the decoder does not report.
 
-Anonymous (embedded) struct fields are treated as ordinary fields — matched by
-type name or tag, **not** flattened into the parent.
-
-#### 3.3.2 Field map caching
+#### 3.3.3 Field map caching
 
 The field map is a pure function of `reflect.Type` and is cached process-wide
 for the life of the program, keyed by type. A cached map is published
 immutable and never edited in place; this is what makes it safe to share
 across goroutines without locking (§10.1).
+
+Immutability now covers the index paths as well: a `[]int` stored in the map is
+never appended to or reused as scratch during a later walk. A path slice handed
+out to a decode is shared by every goroutine decoding that type.
 
 ### 3.4 Reuse
 
@@ -168,9 +287,15 @@ Decoding into a non-zero destination:
 | array | replaced wholesale; §4 requires an exact length match, so every element is overwritten and no stale tail can survive |
 | map | replaced, not merged |
 | struct | fields present in the input are overwritten; **fields absent from the input are left as they were** |
+| embedded pointer | reused if non-nil; allocated only if some promoted key arrives (§3.2, §3.3.1) |
 
 The struct rule means a reused destination can return a mix of new and stale
 data. Callers who care must decode into a zero value.
+
+The embedded-pointer row follows from the struct row one level down: a
+promoted field is an ordinary field of the embedded struct, so decoding into a
+reused destination overwrites exactly the promoted keys the input carried and
+leaves the rest of the embedded struct alone.
 
 ---
 
@@ -328,6 +453,12 @@ consumed-offset counter of §9.5, which is maintained unconditionally.
 
 `Struct` and `Field` are best-effort: populated when the failing value was
 being decoded into a struct field, empty otherwise.
+
+For a **promoted** field (§3.3.1) `Struct` names the type that *declares* the
+field, not the outer type being decoded, and `Field` is the declared Go field
+name. `Common.Announce`, not `Torrent.Announce`: the outer type is findable
+from the call site, while the declaring type is the one the reader has to go
+looking for.
 
 ### 5.3 EOF
 
@@ -531,16 +662,29 @@ distinguish it from a crash. Every reflect operation that can panic —
 `Set` on a value obtained through an unexported field — must be guarded by a
 check that returns an error first.
 
-The two known panic sources, both closed by rules elsewhere in this document,
-are recorded here because they are the ones that will come back:
+The known panic sources, each closed by a rule elsewhere in this document, are
+recorded here because they are the ones that will come back:
 
 | panic | closed by |
 |---|---|
 | `SetMapIndex` with `string` into a named-string-keyed map | §4, conversion to `K` |
-| `Set` on a read-only value from an unexported embedded field | §3.1 + §3.3 rule 1 |
+| `Set` on a value reached through an unexported **named** field | §3.3 rule 1 — only anonymous fields are descended into |
+| `Set` on an embedded pointer to an unexported struct (`*common`) | §3.3.1, pruned when the field map is built |
+| unbounded recursion building the field map for a recursive type | §3.3.1, one visit per type per depth level |
+
+The second row is the one that changed in draft 3 and the one most likely to be
+re-broken. Lifting out of an unexported embedded struct is safe, and looks
+almost identical in code to binding an unexported field, which is not. The
+distinction — an unexported *embedded* field's read-only marker is not
+inherited by its fields, an unexported *named* field's is — lives in `reflect`,
+not in this decoder, so a test must hold it: decoding into a struct with an
+unexported embedded struct must populate the promoted field, and a struct with
+an unexported named struct field must leave it untouched.
 
 A fuzz target that decodes arbitrary bytes into a fixture struct containing
-every destination shape in §4 is the standing test for this section.
+every destination shape in §4 is the standing test for this section. Draft 3
+extends the fixture with each row of the §3.3.1 table, including `*common` and
+a self-referential embedded pointer.
 
 ---
 
@@ -757,9 +901,13 @@ err := NewDecoder(bytes.NewReader(t.Info)).Decode(&info)
 
 The two-step is not a stylistic preference. A struct cannot capture `info` raw
 *and* decode it into a typed field at the same time: two fields tagged
-`bencode:"info"` are two tagged candidates for one key, which §3.3.1 rule 2
+`bencode:"info"` are two tagged candidates for one key, which §3.3.2 rule 3
 makes **ambiguous**, binding the key to neither. Both fields would come back
 zero. Capture once, decode from the bytes.
+
+Embedding does not provide a way around this either: two tagged candidates at
+*different* depths are resolved by §3.3.2 rule 1, so the shallower one simply
+shadows the deeper, and only one of the two fields is ever populated.
 
 ---
 
@@ -771,7 +919,7 @@ A `Decoder` is **not safe for concurrent use**. It owns a read position, a
 sticky error and a capture window, none of which are synchronised. One decoder
 per goroutine, or external locking.
 
-The field map cache (§3.3.2) **is** safe for concurrent use and is shared
+The field map cache (§3.3.3) **is** safe for concurrent use and is shared
 across all decoders in the process. Its entries are published immutable, so
 readers need no synchronisation once an entry exists.
 
@@ -817,6 +965,15 @@ Recorded so they are not silently defaulted:
 - **`TypeError.Struct` / `.Field`.** Populating them requires threading a
   small context through the decode path. Worth it, or is `Offset` + `Type`
   enough in practice?
+- **Silent prunes (§3.3.1).** An embedded `*common`, an ambiguous key and a
+  `bencode:"-"` field are all invisible: the destination is simply never
+  written. A `FieldMapError` returned from the first `Decode` against a type
+  would catch these at first use, at the cost of an error path for what is
+  always a programming error. Deferred, not rejected — but if it is ever added
+  it should cover all three, not just embedding.
+- **Depth cap on the field-tree walk.** Cycle detection bounds the walk, but a
+  pathological generated type could still produce a very wide map. No limit is
+  specified; add one only if a real type ever needs it.
 
 ---
 
@@ -891,3 +1048,59 @@ freely.
 - **`Limits` as a struct field with zero-means-default (§7.1)** rather than
   package-level constants or setter methods. Constants were untunable; setters
   would be four methods for four numbers.
+
+---
+
+## Appendix B — changes from draft 2
+
+One subject: **embedded fields are now lifted** (§3.3.1). Draft 2 listed
+flattening as a non-goal and treated an anonymous field as an ordinary one
+keyed by its type name.
+
+### Behaviour changes
+
+- **§1** — "embedded / anonymous struct flattening" removed from non-goals.
+- **§3.3** — a struct now resolves to key → **index path** (`[]int`), not
+  key → field index. Every path in a struct with no embedding has length 1, so
+  nothing about a flat struct changes.
+- **§3.3.1 added.** An untagged embedded struct or pointer-to-struct is walked
+  through and its fields promoted. Tagged, `-`-tagged and non-struct anonymous
+  fields stay ordinary fields.
+- **Breaking: an untagged embedded struct no longer has a key of its own.**
+  Under draft 2, `Common` embedded in `Torrent` bound the key `Common`; now the
+  key `Common` binds to nothing and `Common`'s fields are reachable under their
+  own keys. Tagging the embedded field restores the old behaviour.
+- **§3.3.2 gained a first rule** — shallowest depth wins — which draft 2
+  explicitly deferred ("Add that rule ahead of these two if flattening is ever
+  adopted"). The tagged/ambiguous rules are unchanged and now apply only among
+  candidates tied at the shallowest depth.
+- **§3.2, §3.4** — embedded pointers are allocated on demand when a promoted
+  key arrives and reused when already non-nil. This is the one way a pointer
+  becomes non-nil without a key naming it.
+- **§5.2** — `Struct`/`Field` on a promoted field name the *declaring* type.
+
+### Invariants that had to move
+
+- **§3.1** — the settability invariant no longer rests on "no unexported field
+  is ever touched", because unexported embedded structs are now walked through.
+  It rests on `reflect`'s distinction between an unexported embedded field's
+  read-only marker (not inherited by its fields) and an unexported named
+  field's (inherited). Rewritten to say so.
+- **§8** — panic table extended: the unexported-embedded row was re-stated in
+  terms of *named* fields, and two new rows added (embedded pointer to an
+  unexported struct, recursive type in the field-map walk).
+
+### Decisions taken here
+
+Reversible; recorded so they are not mistaken for consequences.
+
+- **Unexported embedded structs are lifted** (`encoding/json`'s behaviour)
+  rather than skipped. Skipping would have kept §3.1's invariant literally
+  true, at the cost of the standard unexported-mixin shape.
+- **An embedded `*common` is pruned when the field map is built**, so the keys
+  under it bind to nothing. `encoding/json` instead reaches decode time and
+  returns an error. A static prune cannot desync a stream, costs nothing per
+  decode, and matches how this spec already treats an ambiguous key.
+- **Cycle detection is one visit per type per depth level**, which is what
+  makes the breadth-first walk terminate on `type Node struct { *Node }`. A
+  depth cap was considered and left out (§11).

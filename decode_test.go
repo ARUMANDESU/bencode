@@ -21,7 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file asserts SPEC.md draft 2 and nothing else. Every test cites the
+// This file asserts SPEC.md draft 3 and nothing else. Every test cites the
 // section it enforces. When a test and the implementation disagree, the spec
 // decides which one is wrong — a test that merely describes what the code
 // happens to do today is worthless, because it can never fail for a reason
@@ -66,14 +66,14 @@ type tagged struct {
 	unexported string `bencode:"unexported"`
 }
 
-// ambiguous pins SPEC §3.3.1: two tagged fields claiming one key bind to
+// ambiguous pins SPEC §3.3.2: two tagged fields claiming one key bind to
 // nothing. Declaration order must not decide.
 type ambiguous struct {
 	A string `bencode:"dup"`
 	B string `bencode:"dup"`
 }
 
-// taggedBeatsUntagged pins the one collision SPEC §3.3.1 does resolve. The two
+// taggedBeatsUntagged pins the one same-depth collision SPEC §3.3.2 resolves. The two
 // types differ only in declaration order, which must not matter.
 type taggedBeatsUntagged struct {
 	A string `bencode:"B"`
@@ -104,7 +104,7 @@ type ambiguousMixed struct {
 }
 
 // optsOnlyVsUntagged pins SPEC §3.3 rules 3 and 4 read together: a tag that
-// supplies no name does NOT make the field tagged for §3.3.1. Both fields here
+// supplies no name does NOT make the field tagged for §3.3.2. Both fields here
 // are untagged claimants of "V", so the key is ambiguous. If `,omitempty`
 // counted as tagged, A would win and this test would fail.
 type optsOnlyVsUntagged struct {
@@ -120,27 +120,156 @@ type caseSensitive struct {
 // between Kind() and Type() when guarding SetMapIndex.
 type namedKey string
 
-// The embedded fixtures below split a case draft 1 conflated. SPEC §3.3 rule 1
-// skips every unexported field, and for an embedded field the field's name is
-// its type's name — so `simple` embedded is an UNEXPORTED field and must be
-// skipped, while `Exported` embedded must not be.
+// The embedded fixtures below are one per row of the SPEC §3.3.1 table, plus
+// the collision shapes §3.3.2 rule 1 exists for. An embedded field's name is
+// its TYPE's name, so `hidden` embedded is an unexported field — which under
+// draft 3 is walked through rather than skipped, while `*hidden` is pruned
+// because allocating it would need a Set on a read-only value (§8).
 type Exported struct {
 	S string `bencode:"s"`
 }
 
+// embedsExported is the tagged embed: a tag asks for the field itself, so it
+// is bound as an ordinary field under "emb" and NOT lifted.
 type embedsExported struct {
 	Exported `bencode:"emb"`
 	Extra    string `bencode:"extra"`
 }
 
+// liftsExported is the same shape untagged, which is the draft 3 change: "s"
+// reaches Exported.S and "Exported" reaches nothing.
+type liftsExported struct {
+	Exported
+	Extra string `bencode:"extra"`
+}
+
+type liftsExportedPtr struct {
+	*Exported
+	Extra string `bencode:"extra"`
+}
+
+// skipsEmbedded pins §3.3 rule 2 against an embedded field: "-" skips the
+// field AND its contents, so neither "s" nor "Exported" binds to anything.
+type skipsEmbedded struct {
+	Exported `bencode:"-"`
+	Extra    string `bencode:"extra"`
+}
+
+// hidden is unexported with exported fields — the mixin shape. reflect marks
+// the embedded field read-only but does not propagate that to its fields, so
+// hidden.S is settable and must be reachable under "s".
+type hidden struct {
+	S string `bencode:"s"`
+	N int64  `bencode:"n"`
+}
+
+type liftsUnexported struct {
+	hidden
+	Extra string `bencode:"extra"`
+}
+
+// liftsUnexportedPtr is the pruned row: the embedded pointer cannot be
+// allocated, so every key under it binds to nothing — silently, like an
+// ambiguous key, and never as a panic.
+type liftsUnexportedPtr struct {
+	*hidden
+	Extra string `bencode:"extra"`
+}
+
+// taggedUnexportedEmbed is invisible per §3.3.1: the tag asks for a binding
+// rule 1 forbids, and asking for a key is not a request to lift.
+type taggedUnexportedEmbed struct {
+	hidden `bencode:"h"`
+	Extra  string `bencode:"extra"`
+}
+
+// Deep/Mid pin that lifting is transitive: "d" is reached at depth 2.
+type Deep struct {
+	D string `bencode:"d"`
+}
+
+type Mid struct {
+	Deep
+}
+
+type liftsTransitively struct {
+	Mid
+	Extra string `bencode:"extra"`
+}
+
+// shadowsEmbedded pins §3.3.2 rule 1: depth 0 beats depth 1 outright, and the
+// promoted field must be left zero rather than written twice.
+type shadowsEmbedded struct {
+	Exported
+	S string `bencode:"s"`
+}
+
+// Left/Right collide at the same depth with no tag between them, which is the
+// decoder's echo of the compile error `x.Name` would be.
+type Left struct {
+	Name string `bencode:"name"`
+}
+
+type Right struct {
+	Name string `bencode:"name"`
+}
+
+type ambiguousEmbeds struct {
+	Left
+	Right
+}
+
+// PlainName/TaggedName collide at the same depth with exactly one tag, which
+// §3.3.2 rule 2 resolves in favour of the tagged one.
+type PlainName struct {
+	Name string
+}
+
+type TaggedName struct {
+	Other string `bencode:"Name"`
+}
+
+type embedTieBrokenByTag struct {
+	PlainName
+	TaggedName
+}
+
+// Diamond: both embeds reach Exported, so "s" has two depth-2 claimants and
+// binds to neither — while "extra" at depth 0 is unaffected.
+type LeftDiamond struct {
+	Exported
+}
+
+type RightDiamond struct {
+	Exported
+}
+
+type diamond struct {
+	LeftDiamond
+	RightDiamond
+	Extra string `bencode:"extra"`
+}
+
+// Recursive makes the field-tree walk infinite unless it stops revisiting a
+// type (§3.3.1). Building its field map must terminate, and "v" must resolve
+// to the depth-0 field rather than to any of its promoted copies.
+type Recursive struct {
+	*Recursive
+	V string `bencode:"v"`
+}
+
+// MyInt is a non-struct named type: embedded, it stays an ordinary field keyed
+// by its type name, never lifted.
+type MyInt int64
+
+type embedsNamedInt struct {
+	MyInt
+	Extra string `bencode:"extra"`
+}
+
 type unexportedMap map[string]int
 
 type unexportedSlice []string
-
-type embedsUnexportedStruct struct {
-	simple
-	Extra string `bencode:"extra"`
-}
 
 type embedsUnexportedMap struct {
 	unexportedMap
@@ -360,6 +489,14 @@ var everyDestinationShape = []struct {
 	{"struct", func() any { return new(simple) }},
 	{"pointer to struct", func() any { return new(*simple) }},
 	{"embedded unexported map", func() any { return new(embedsUnexportedMap) }},
+	// The §3.3.1 rows whose reflect operations panic when unguarded: lifting
+	// out of an unexported struct is legal, allocating a pointer to one is
+	// not, and a recursive embed must not hang the field-map walk.
+	{"embedded unexported struct", func() any { return new(liftsUnexported) }},
+	{"embedded pointer to unexported struct", func() any { return new(liftsUnexportedPtr) }},
+	{"embedded pointer", func() any { return new(liftsExportedPtr) }},
+	{"recursive embed", func() any { return new(Recursive) }},
+	{"diamond embed", func() any { return new(diamond) }},
 	// SPEC §9: capture accepts every input shape, so it is the one
 	// destination that must survive the whole corpus without erroring — which
 	// makes it the one most likely to walk off the end of a truncated value.
@@ -720,7 +857,7 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 		})
 	})
 
-	// SPEC §3.3.1 rule 2: an ambiguous key binds to nothing, the way
+	// SPEC §3.3.2 rule 3: an ambiguous key binds to nothing, the way
 	// encoding/json drops a name two same-depth fields both claim. Declaration
 	// order must not decide, so neither field may be populated.
 	t.Run("two tagged fields claiming one key: neither wins", func(t *testing.T) {
@@ -757,8 +894,8 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 		})
 	})
 
-	// SPEC §3.3.1 rule 1: the one collision that does resolve. Both orderings
-	// must give the same answer.
+	// SPEC §3.3.2 rule 2: the one same-depth collision that does resolve. Both
+	// orderings must give the same answer.
 	t.Run("a tagged field beats an untagged one claiming the same key", func(t *testing.T) {
 		t.Parallel()
 		input := mustEncode(t, bencodeast.Dict{"B": bencodeast.Str("v")})
@@ -782,7 +919,7 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 
 	// SPEC §3.3 rules 3 and 4: only a tag that supplies a NAME makes a field
 	// tagged. `bencode:",omitempty"` supplies options and no name, so it is an
-	// untagged claimant and cannot win rule 1.
+	// untagged claimant and cannot win §3.3.2 rule 2.
 	t.Run("an options-only tag does not make a field tagged", func(t *testing.T) {
 		t.Parallel()
 		var got optsOnlyVsUntagged
@@ -803,20 +940,51 @@ func TestSpec3_3_FieldMapping(t *testing.T) {
 	})
 }
 
-// SPEC §3.3 rule 1 says "unexported → always skipped, INCLUDING embedded
-// fields", and §3.1 depends on it: admitting a read-only reflect.Value into
-// the decode path turns the internal CanSet assertions into reachable code and
-// panics in the container paths, which call Set on the whole value.
+// SPEC §3.3.1: an untagged embedded struct is not a destination — its fields
+// are promoted into the parent's key space, because that is what embedding
+// means in Go and a key space that disagrees with the selector space makes
+// shared field sets useless.
 //
-// An embedded field's name is its type's name, so `simple` embedded is an
-// unexported field. Draft 1 admitted it and appeared to work — but only for
-// struct-typed embeds, because reflect does not propagate flagEmbedRO to the
-// fields underneath. Map- and slice-typed embeds panic on the Set at the end
-// of their branch. That is one working shape out of four, not a feature.
-func TestSpec3_3_EmbeddedFields(t *testing.T) {
+// The failure modes here are asymmetric, which is why this is a table of
+// shapes rather than one happy-path test. Lifting too little is quiet: a
+// promoted field stays zero and the key looks unknown. Lifting too much is
+// loud: a read-only reflect.Value reaches a Set and the decoder panics (§8),
+// which §3.1's settability invariant exists to prevent. The line between the
+// two is reflect's own — an unexported EMBEDDED field's read-only marker is
+// not inherited by its fields, an unexported NAMED field's is — so both sides
+// of it get a test.
+func TestSpec3_3_1_EmbeddedFields(t *testing.T) {
 	t.Parallel()
 
-	t.Run("an exported embedded field is an ordinary field, not flattened", func(t *testing.T) {
+	t.Run("an untagged embedded struct is lifted", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{
+			"s":     bencodeast.Str("promoted"),
+			"extra": bencodeast.Str("outer"),
+		})
+
+		var got liftsExported
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "promoted", got.Exported.S, `"s" must reach the promoted field`)
+		assert.Equal(t, "outer", got.Extra)
+	})
+
+	// The draft 2 → 3 breaking change, pinned from the losing side: under draft
+	// 2 this key bound the embedded struct itself.
+	t.Run("a lifted embed has no key of its own", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{
+			"Exported": bencodeast.Dict{"s": bencodeast.Str("must not bind")},
+			"extra":    bencodeast.Str("kept"),
+		})
+
+		var got liftsExported
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "", got.Exported.S, "the type name of a lifted embed is not a key")
+		assert.Equal(t, "kept", got.Extra, "the decoder must stay in sync while skipping it")
+	})
+
+	t.Run("a tagged embed is bound as an ordinary field, not lifted", func(t *testing.T) {
 		t.Parallel()
 		input := mustEncode(t, bencodeast.Dict{
 			"emb":   bencodeast.Dict{"s": bencodeast.Str("inner")},
@@ -826,29 +994,107 @@ func TestSpec3_3_EmbeddedFields(t *testing.T) {
 
 		var got embedsExported
 		require.NoError(t, decode(t, input, &got))
-		assert.Equal(t, "inner", got.Exported.S)
+		assert.Equal(t, "inner", got.Exported.S, "the tag names the field itself")
 		assert.Equal(t, "outer", got.Extra)
 	})
 
-	// One subtest per underlying kind, because the failure mode differs: the
-	// struct case silently populates, the map and slice cases panic.
-	t.Run("unexported embedded fields are skipped for every underlying kind", func(t *testing.T) {
+	t.Run("a dash-tagged embed lifts nothing", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{
+			"s":        bencodeast.Str("must not bind"),
+			"Exported": bencodeast.Dict{"s": bencodeast.Str("must not bind either")},
+			"extra":    bencodeast.Str("kept"),
+		})
+
+		var got skipsEmbedded
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "", got.Exported.S, `"-" skips the field AND its contents`)
+		assert.Equal(t, "kept", got.Extra)
+	})
+
+	t.Run("lifting is transitive", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{
+			"d":     bencodeast.Str("two levels up"),
+			"extra": bencodeast.Str("outer"),
+		})
+
+		var got liftsTransitively
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "two levels up", got.Mid.Deep.D)
+		assert.Equal(t, "outer", got.Extra)
+	})
+
+	// An embedded field's name is its type's name, so these are unexported
+	// fields. The struct is walked through; the pointer is pruned; the
+	// non-struct kinds stay ordinary fields that rule 1 then skips.
+	t.Run("unexported embeds", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("struct", func(t *testing.T) {
+		t.Run("a struct is walked through to its exported fields", func(t *testing.T) {
 			t.Parallel()
 			input := mustEncode(t, bencodeast.Dict{
-				"simple": bencodeast.Dict{"s": bencodeast.Str("must not bind")},
+				"s":     bencodeast.Str("promoted"),
+				"n":     bencodeast.Int(7),
+				"extra": bencodeast.Str("outer"),
+			})
+
+			var got liftsUnexported
+			require.NoError(t, decode(t, input, &got))
+			assert.Equal(t, "promoted", got.hidden.S,
+				"reflect does not propagate an embedded field's read-only marker to its fields")
+			assert.Equal(t, int64(7), got.hidden.N)
+			assert.Equal(t, "outer", got.Extra)
+		})
+
+		t.Run("the embed itself is still not a key", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{
+				"hidden": bencodeast.Dict{"s": bencodeast.Str("must not bind")},
 				"extra":  bencodeast.Str("kept"),
 			})
 
-			var got embedsUnexportedStruct
+			var got liftsUnexported
 			require.NoError(t, decode(t, input, &got))
-			assert.Equal(t, simple{}, got.simple,
-				"the type name of an unexported embed is not a key")
-			assert.Equal(t, "kept", got.Extra, "the decoder must stay in sync while skipping it")
+			assert.Equal(t, hidden{}, got.hidden)
+			assert.Equal(t, "kept", got.Extra)
 		})
 
+		// The prune is the alternative to a panic, not to an error: allocating
+		// this pointer means Set on a read-only value. §3.3.1 makes it a
+		// property of the type, so the keys under it simply go unbound.
+		t.Run("a pointer to an unexported struct is pruned, not panicked on", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{
+				"s":     bencodeast.Str("unreachable"),
+				"n":     bencodeast.Int(1),
+				"extra": bencodeast.Str("kept"),
+			})
+
+			var got liftsUnexportedPtr
+			require.NoError(t, decode(t, input, &got))
+			assert.Nil(t, got.hidden, "the decoder must not allocate a read-only pointer")
+			assert.Equal(t, "kept", got.Extra, "the rest of the dict still decodes")
+		})
+
+		t.Run("a tagged unexported embed is invisible", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{
+				"h":     bencodeast.Dict{"s": bencodeast.Str("must not bind")},
+				"s":     bencodeast.Str("must not bind either"),
+				"extra": bencodeast.Str("kept"),
+			})
+
+			var got taggedUnexportedEmbed
+			require.NoError(t, decode(t, input, &got))
+			assert.Equal(t, hidden{}, got.hidden,
+				"a tag asks for a binding rule 1 forbids; it is not a request to lift")
+			assert.Equal(t, "kept", got.Extra)
+		})
+
+		// Map and slice embeds are not struct-kinded, so they are ordinary
+		// unexported fields and skipped. Kept apart because the failure mode
+		// differs: these panic on the Set at the end of their branch.
 		t.Run("map", func(t *testing.T) {
 			t.Parallel()
 			input := mustEncode(t, bencodeast.Dict{
@@ -874,6 +1120,132 @@ func TestSpec3_3_EmbeddedFields(t *testing.T) {
 			assert.Nil(t, got.unexportedSlice)
 			assert.Equal(t, "kept", got.Extra)
 		})
+	})
+
+	t.Run("an embedded non-struct type stays an ordinary field", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{
+			"MyInt": bencodeast.Int(5),
+			"extra": bencodeast.Str("outer"),
+		})
+
+		var got embedsNamedInt
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, MyInt(5), got.MyInt, "there is nothing to lift out of a named int")
+		assert.Equal(t, "outer", got.Extra)
+	})
+
+	// SPEC §3.2: an embedded pointer is the one pointer that becomes non-nil
+	// without a key naming it — and only when a key underneath it arrives.
+	t.Run("embedded pointers", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("allocated when a promoted key arrives", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{
+				"s":     bencodeast.Str("through the pointer"),
+				"extra": bencodeast.Str("outer"),
+			})
+
+			var got liftsExportedPtr
+			require.NoError(t, decode(t, input, &got))
+			require.NotNil(t, got.Exported)
+			assert.Equal(t, "through the pointer", got.Exported.S)
+			assert.Equal(t, "outer", got.Extra)
+		})
+
+		t.Run("left nil when no promoted key arrives", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{"extra": bencodeast.Str("outer")})
+
+			var got liftsExportedPtr
+			require.NoError(t, decode(t, input, &got))
+			assert.Nil(t, got.Exported,
+				"allocating here would report a key the input never carried")
+		})
+
+		// SPEC §3.4: reuse reaches through the embed. A replaced pointer would
+		// silently discard fields the input did not mention.
+		t.Run("a non-nil embedded pointer is reused, not replaced", func(t *testing.T) {
+			t.Parallel()
+			input := mustEncode(t, bencodeast.Dict{"extra": bencodeast.Str("new")})
+
+			existing := &Exported{S: "old"}
+			got := liftsExportedPtr{Exported: existing, Extra: "stale"}
+			require.NoError(t, decode(t, input, &got))
+
+			assert.Same(t, existing, got.Exported, "the embedded pointer must not be reallocated")
+			assert.Equal(t, "old", got.Exported.S, "a key absent from the input changes nothing")
+			assert.Equal(t, "new", got.Extra)
+		})
+	})
+
+	// A recursive type makes the field-tree walk infinite unless it stops
+	// revisiting a type. If the field map hangs or blows the stack, this test
+	// never reports — which is the point: it must be caught here and not by a
+	// caller whose torrent parser stopped responding.
+	t.Run("a recursive embed terminates and resolves to depth 0", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{"v": bencodeast.Str("outer")})
+
+		var got Recursive
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "outer", got.V)
+		assert.Nil(t, got.Recursive, "no key bound below the embed, so nothing is allocated")
+	})
+}
+
+// SPEC §3.3.2 rule 1 — shallowest wins. This is the rule draft 2 could not
+// have, and the rule that makes embedding usable: an outer field shadows a
+// promoted one exactly as `t.S` does in Go.
+func TestSpec3_3_2_CompetingAcrossDepths(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a depth 0 field shadows a promoted one", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{"s": bencodeast.Str("outer wins")})
+
+		var got shadowsEmbedded
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "outer wins", got.S)
+		assert.Equal(t, "", got.Exported.S, "the shadowed field must not be written too")
+	})
+
+	t.Run("two embeds claiming one key at the same depth bind to neither", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{"name": bencodeast.Str("v")})
+
+		var got ambiguousEmbeds
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, ambiguousEmbeds{}, got,
+			"Go makes the same selector a compile error; the decoder binds nothing")
+	})
+
+	t.Run("one tag breaks a same-depth tie between embeds", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{"Name": bencodeast.Str("v")})
+
+		var got embedTieBrokenByTag
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "v", got.TaggedName.Other, "exactly one tagged candidate wins")
+		assert.Equal(t, "", got.PlainName.Name)
+	})
+
+	// The diamond is the shape where a depth-first walk would quietly pick a
+	// winner: whichever branch it reached first. Breadth-first plus rule 3
+	// makes it ambiguous regardless of declaration order.
+	t.Run("a diamond is ambiguous at depth 2", func(t *testing.T) {
+		t.Parallel()
+		input := mustEncode(t, bencodeast.Dict{
+			"s":     bencodeast.Str("v"),
+			"extra": bencodeast.Str("kept"),
+		})
+
+		var got diamond
+		require.NoError(t, decode(t, input, &got))
+		assert.Equal(t, "", got.LeftDiamond.Exported.S)
+		assert.Equal(t, "", got.RightDiamond.Exported.S)
+		assert.Equal(t, "kept", got.Extra, "an ambiguous key is skipped, not fatal")
 	})
 }
 
@@ -1699,6 +2071,21 @@ func TestSpec5_2_StructuredErrors(t *testing.T) {
 			var te *TypeError
 			require.ErrorAs(t, err, &te)
 			assert.Equal(t, "simple", te.Struct)
+			assert.Equal(t, "S", te.Field)
+		})
+
+		// SPEC §5.2: for a promoted field, Struct names the type that DECLARES
+		// it, not the one being decoded into. The outer type is visible at the
+		// call site; the declaring type is the one the reader has to hunt for.
+		t.Run("a promoted field reports its declaring type", func(t *testing.T) {
+			t.Parallel()
+			var got liftsExported
+			err := decode(t, "d1:sl1:aee", &got)
+			require.Error(t, err)
+
+			var te *TypeError
+			require.ErrorAs(t, err, &te)
+			assert.Equal(t, "Exported", te.Struct, "not liftsExported")
 			assert.Equal(t, "S", te.Field)
 		})
 
