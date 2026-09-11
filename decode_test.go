@@ -16,7 +16,7 @@ import (
 	"sync"
 	"testing"
 
-	bencodeast "github.com/ARUMANDESU/bencode/pkg/bencode_ast"
+	bencodeast "github.com/arumandesu/bencode/pkg/bencode_ast"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

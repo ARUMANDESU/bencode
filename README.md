@@ -7,7 +7,7 @@ from an `io.Reader` instead of requiring the whole input in memory.
 Requires Go 1.26 or newer.
 
 ```
-go get github.com/ARUMANDESU/bencode
+go get github.com/arumandesu/bencode
 ```
 
 ## Usage
@@ -18,7 +18,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/ARUMANDESU/bencode"
+	"github.com/arumandesu/bencode"
 )
 
 type Torrent struct {

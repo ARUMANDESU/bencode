@@ -1,4 +1,4 @@
-module github.com/ARUMANDESU/bencode
+module github.com/arumandesu/bencode
 
 go 1.26.1
 
