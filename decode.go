@@ -969,7 +969,7 @@ func (d *Decoder) useCustomUnmarshal(v reflect.Value, u Unmarshaler) error {
 		return fillType(err, v.Type())
 	}
 
-	err = u.UnmarshalBencode(raw)
+	err = u.UnmarshalBencode(slices.Clone(raw))
 	if err != nil {
 		return &TypeError{Offset: d.off, Type: v.Type(), cause: err}
 	}
