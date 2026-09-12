@@ -361,7 +361,7 @@ func populateCandidates(t reflect.Type, prevIdx []int, candidates map[string][]f
 			continue
 		}
 
-		name, isExplicit, idxs := field.Name, false, append(prevIdx, i)
+		name, isExplicit, idxs := field.Name, false, append(slices.Clone(prevIdx), i)
 		if raw, ok := field.Tag.Lookup(tagName); ok {
 			tag, _, hasOpts := strings.Cut(raw, ",")
 			if tag == "-" && !hasOpts {
