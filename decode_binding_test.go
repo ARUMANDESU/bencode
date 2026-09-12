@@ -706,7 +706,7 @@ func TestSpec4_IntegerDestinations(t *testing.T) {
 	})
 
 	// SPEC §4: i0e is false, any other integer is true. Consistent with the
-	// lenient stance in §2.1; listed in §11 as still open.
+	// lenient stance in §2.1; listed in §12 as still open.
 	t.Run("bool", func(t *testing.T) {
 		t.Parallel()
 		tests := []struct {

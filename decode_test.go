@@ -27,7 +27,8 @@ import (
 //	decode_errors_test.go       §6 stream contract
 //	decode_limits_test.go       §7 limits, §8 never panics
 //	decode_raw_test.go          §9 RawMessage
-//	decode_integration_test.go  §10.1 concurrency, real torrent files
+//	decode_custom_test.go       §10 custom unmarshaling
+//	decode_integration_test.go  §11.1 concurrency, real torrent files
 //	decode_fuzz_test.go         fuzz targets
 
 // ---------------------------------------------------------------------------

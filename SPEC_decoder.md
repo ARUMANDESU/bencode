@@ -19,11 +19,13 @@ machinery. It differs from `Decoder` in exactly one way — it **rejects trailin
 bytes** after the value (§2), because a caller who handed over a finite byte
 slice meant all of it. See §6.4.
 
+Also in scope: two escape hatches for types the reflection rules cannot
+express — a custom `Unmarshaler` interface and `encoding.TextUnmarshaler`,
+including as map keys. See §10.
+
 Non-goals for v1 (listed so their absence is a decision, not an oversight):
 
 - encoding
-- a custom `Unmarshaler` interface
-- `encoding.TextUnmarshaler` map keys
 - strict canonical-form validation
 - case-insensitive field matching
 - recovery from type errors (§6.2 explains why this is architectural, not
@@ -271,7 +273,7 @@ An ambiguous key is a programming error the decoder does not report.
 The field map is a pure function of `reflect.Type` and is cached process-wide
 for the life of the program, keyed by type. A cached map is published
 immutable and never edited in place; this is what makes it safe to share
-across goroutines without locking (§10.1).
+across goroutines without locking (§11.1).
 
 Immutability now covers the index paths as well: a `[]int` stored in the map is
 never appended to or reused as scratch during a later walk. A path slice handed
@@ -303,6 +305,9 @@ leaves the rest of the embedded struct alone.
 
 `ErrTypeMismatch` for every combination not listed. Non-empty interface
 destinations are always `ErrTypeMismatch`.
+
+A destination implementing one of §10's interfaces is handled there and never
+reaches these tables. The tables are what a type gets when it stays silent.
 
 ### bencode integer →
 
@@ -350,7 +355,8 @@ list.
 | struct | §3.3 |
 | `map[string]T` | replaced; an empty dict yields a **non-nil, empty** map |
 | `map[K]T` where `K` is a string **kind** | supported, **including named string types** (`type Key string`); keys are converted to `K` |
-| `map[K]T`, `K` not string-kinded | `ErrTypeMismatch`, checked **before** the map is allocated and before any entry is decoded — never a panic |
+| `map[K]T` where `*K` implements `encoding.TextUnmarshaler` | supported whatever `K`'s kind; the key bytes go through `UnmarshalText` (§10.4) |
+| `map[K]T`, `K` neither of the above | `ErrTypeMismatch`, checked **before** the map is allocated and before any entry is decoded — never a panic |
 | `any` | `map[string]any` |
 | `*T` | allocate, recurse |
 | `RawMessage` | verbatim bytes (§9) |
@@ -595,7 +601,7 @@ type Decoder struct {
 
 `Limits` is read at the **start of each `Decode`**. Changing it between calls
 is supported and well-defined; changing it during a call is not possible from
-a correct program (§10.1). A zero field means "use the default", so a partial
+a correct program (§11.1). A zero field means "use the default", so a partial
 override needs no constructor variant.
 
 `MaxDepth` is a `uint` because a negative nesting limit has no meaning: the
@@ -671,6 +677,8 @@ recorded here because they are the ones that will come back:
 | `Set` on a value reached through an unexported **named** field | §3.3 rule 1 — only anonymous fields are descended into |
 | `Set` on an embedded pointer to an unexported struct (`*common`) | §3.3.1, pruned when the field map is built |
 | unbounded recursion building the field map for a recursive type | §3.3.1, one visit per type per depth level |
+| single-value interface assert when probing for §10's interfaces | §10.2 — the probe asserts to the interface the call site asked for, comma-ok, and never force-casts the result of one probe into the other interface |
+| `UnmarshalText` on a map key obtained by conversion | §10.4, the key is allocated with `reflect.New` so it is addressable |
 
 The second row is the one that changed in draft 3 and the one most likely to be
 re-broken. Lifting out of an unexported embedded struct is safe, and looks
@@ -911,9 +919,167 @@ shadows the deeper, and only one of the two fields is ever populated.
 
 ---
 
-## 10. Concurrency and compatibility
+## 10. Custom unmarshaling
 
-### 10.1 Concurrency
+```go
+type Unmarshaler interface {
+	UnmarshalBencode([]byte) error
+}
+```
+
+together with `encoding.TextUnmarshaler` from the standard library.
+
+### 10.1 The two interfaces are not the same interface
+
+| interface | receives | fires on |
+|---|---|---|
+| `Unmarshaler` | the **verbatim bytes of the complete value**, §9.1 semantics: type prefix, length prefix and terminator included | any bencode type |
+| `encoding.TextUnmarshaler` | the string's **content**, length prefix stripped | bencode **string** only |
+
+The division of labour is §9.1's, one level up:
+
+> `TextUnmarshaler` gets the **content**. `Unmarshaler` gets the **value**.
+
+Both are kept because each covers what the other cannot. Only `Unmarshaler`
+can bind a non-string: a `time.Duration` from `i1234567890e`, a `pieces` string
+split into `[][20]byte`, a DHT `nodes` list turned into `[]net.Addr`. Only
+`TextUnmarshaler` gets the types that already implement it — `net.IP`,
+`netip.Addr`, `time.Time`, `big.Int` — working with no method written in this
+package's terms at all, and it is the only route to a non-string map key
+(§10.4).
+
+A `TextUnmarshaler` destination facing a non-string value is **not** special
+cased: §4 applies unchanged. An integer or a list into a `netip.Addr` is
+`ErrTypeMismatch` — the contract is text, and a list is not text.
+
+A **dict** is the exception, and not a deliberate one. §4 maps a dict onto a
+struct destination by §3.3, and `netip.Addr`, `time.Time` and `big.Int` are all
+structs, so a dict binds against their fields, matches nothing exported, and
+reports success while leaving the destination zero. §12 records this.
+
+bencode strings are arbitrary byte strings and need not be UTF-8 (§2). They are
+handed to `UnmarshalText` unchanged rather than validated or replaced. The
+interface is named for text and this decoder feeds it bytes; `encoding/json`
+has the same wart and it is not worth a second interface to fix.
+
+### 10.2 Precedence, and how the method is found
+
+Checked in order, first match wins:
+
+1. `RawMessage` (§9)
+2. `Unmarshaler`
+3. `encoding.TextUnmarshaler` — only once the value is known to be a string
+4. the type mapping of §4
+
+`RawMessage` declares neither method, so its position is an ordering statement
+rather than a conflict rule. `Unmarshaler` outranks `TextUnmarshaler` because
+it is the strictly more informed of the two: it sees the value's type, and a
+type that implements both has said it can handle every case.
+
+Positions 2 and 3 differ in *where* they are checked. `Unmarshaler` is checked
+on entry to a value, before the first byte is read, because it consumes the
+value whole. `TextUnmarshaler` is checked inside the string path, after the
+length prefix and content have been read.
+
+**Lookup uses the addressable form of the destination.** Both methods must
+mutate their receiver, so both are declared on `*T` far more often than on `T`,
+and `T`'s method set does not contain them. The decoder takes the destination's
+address before probing whenever it is not already a pointer. §3.1 guarantees
+every destination inside the decoder is addressable, so this always succeeds; a
+value receiver is found either way.
+
+**The probe asserts to the interface the call site asked for, comma-ok.** It
+must not probe one interface and cast the result into the other: a type
+implementing exactly one of the two — which is every type named in §10.1 —
+then panics out of `Decode`. §8 records this.
+
+### 10.3 The bytes are borrowed, not given
+
+The slice passed to `UnmarshalBencode` aliases the decoder's capture buffer and
+is valid **only for the duration of the call**. An implementation that wants to
+retain it must copy it.
+
+This is the one place §9.2 rule 3's ownership guarantee does not extend.
+`RawMessage` copies because the value escapes into the caller's struct and
+outlives the decode; an `Unmarshaler` is handed the buffer while it is still
+live, and the overwhelmingly common implementation parses and discards. Paying
+for a copy on every value to protect the rare retainer is the wrong trade, and
+it is the trade `encoding/json` makes for `UnmarshalJSON` too.
+
+Capture runs on §9.3's machinery, so `MaxCaptureBytes` (§7.1) bounds an
+`Unmarshaler` value exactly as it bounds a `RawMessage`, and recording is
+switched on for the span and off again afterwards (§9.6).
+
+### 10.4 Map keys
+
+`map[K]T` is accepted when `*K` implements `encoding.TextUnmarshaler`,
+whatever `K`'s kind — this is what makes `map[netip.Addr]Peer` decodable. The
+check is computed once from the map type, **before the map is allocated and
+before any entry is read**, which is the same point §4 requires for the
+string-kind check and what keeps §8's no-panic rule intact.
+
+Each key is allocated with `reflect.New(K)` and unmarshaled through the
+resulting pointer. Converting the key bytes instead
+(`reflect.ValueOf(key).Convert(K)`) is not equivalent and is wrong twice over:
+the result is not addressable, so a pointer receiver is invisible, and a value
+receiver would mutate a copy that is then discarded. `Convert` also panics
+outright for a `K` that is not string-kinded, which is precisely the case this
+rule exists to serve.
+
+`Unmarshaler` is **not** consulted for map keys. A dict key is always a bencode
+string (§2), so the whole-value form would only add a second spelling of what
+`UnmarshalText` already does. `encoding/json` draws the line in the same place.
+
+### 10.5 Errors
+
+An error returned by either method is wrapped in a `*TypeError` carrying the
+offset of the value and the destination type, with the returned error as the
+cause. `errors.Is` and `errors.As` reach through it to whatever the method
+returned.
+
+This departs from `encoding/json`, which returns the user's error verbatim. The
+offset is the reason: a custom unmarshaler that fails four megabytes into a
+stream is unlocatable without one, and §6.1 has already poisoned the decoder by
+then, so the caller has no other way to recover the position.
+
+The consequence is that such a `*TypeError` does **not** wrap `ErrTypeMismatch`
+— a caller matching on that sentinel will not match it. That is correct: the
+failure belongs to the type, and the decoder has not classified anything as a
+mismatch.
+
+### 10.6 Requirements
+
+1. **Both receiver forms.** A pointer-receiver `UnmarshalBencode` must be found
+   on a plain field, a pointer field, a slice element, a map value and the
+   top-level destination. The pointer-receiver case is the one that breaks
+   silently, because failing to find the method falls through to §4 and looks
+   like an ordinary type error.
+2. **Exactly one interface.** A type implementing only `UnmarshalBencode` and a
+   type implementing only `UnmarshalText` must each decode without panicking,
+   in a value position and in a map-key position. This is §10.2's last
+   paragraph and it has already been broken once.
+3. **Both interfaces.** A type implementing both must take the `Unmarshaler`
+   path for every bencode type, including strings.
+4. **Every bencode type.** `UnmarshalBencode` must receive `i42e`, `4:spam`,
+   `li1ee` and `d1:ai1ee` verbatim, terminators included.
+5. **Text against a non-string.** An integer, list or dict into a
+   `TextUnmarshaler`-only destination is `ErrTypeMismatch`, not a call with
+   improvised bytes.
+6. **Non-UTF-8.** A key and a value containing invalid UTF-8 and NUL reach
+   `UnmarshalText` byte-identical.
+7. **Limits and capture.** An `Unmarshaler` value longer than
+   `MaxCaptureBytes` is a `LimitError`, and recording is off again after the
+   call — a second `RawMessage`-free decode on the same `Decoder` must retain
+   nothing.
+8. **Errors.** A method returning a sentinel yields a `*TypeError` whose
+   `Offset` is the value's start and which `errors.Is`-matches that sentinel
+   but not `ErrTypeMismatch`.
+
+---
+
+## 11. Concurrency and compatibility
+
+### 11.1 Concurrency
 
 A `Decoder` is **not safe for concurrent use**. It owns a read position, a
 sticky error and a capture window, none of which are synchronised. One decoder
@@ -923,7 +1089,7 @@ The field map cache (§3.3.3) **is** safe for concurrent use and is shared
 across all decoders in the process. Its entries are published immutable, so
 readers need no synchronisation once an entry exists.
 
-### 10.2 What is covered by compatibility
+### 11.2 What is covered by compatibility
 
 Committed, will not change without a major version:
 
@@ -934,6 +1100,7 @@ Committed, will not change without a major version:
 - the type mappings of §4
 - the field resolution rules of §3.3
 - the stream contract of §6.1
+- the `Unmarshaler` interface, and the precedence of §10.2
 
 Not committed, may change in any release:
 
@@ -945,7 +1112,7 @@ Not committed, may change in any release:
 
 ---
 
-## 11. Open decisions
+## 12. Open decisions
 
 Recorded so they are not silently defaulted:
 
@@ -971,6 +1138,25 @@ Recorded so they are not silently defaulted:
   would catch these at first use, at the cost of an error path for what is
   always a programming error. Deferred, not rejected — but if it is ever added
   it should cover all three, not just embedding.
+- **A dict into a struct-kinded `TextUnmarshaler` (§10.1).** Today it binds by
+  §3.3, matches no exported field and returns nil, leaving the destination
+  zero — silent success on input the type cannot represent, which is the
+  outcome §8 and the "silent prunes" entry below both exist to avoid. The fix
+  is to make a non-string value `ErrTypeMismatch` whenever the destination
+  implements `TextUnmarshaler`, moving the check off the string path and onto
+  the value dispatch. The argument for leaving it is `encoding/json` parity:
+  json binds a JSON object to a struct the same way, and only escapes the
+  problem because its ecosystem types implement `json.Unmarshaler` as well.
+  That is luck, not design, and bencode has no equivalent luck. Decide before
+  v1; `decode_custom_test.go` holds a skipped test for the fixed behaviour.
+- **Borrowed bytes (§10.3).** An `Unmarshaler` that retains the slice it was
+  given sees it overwritten later, with no diagnostic. A build-tag-guarded mode
+  that hands out a copy, or scribbles over the buffer after the call, would
+  turn that into a test failure instead of a field report. Cheap; not done.
+- **`Unmarshaler` for map keys (§10.4).** Rejected on the grounds that a key is
+  always a string. The counter-argument is uniformity: a type that implements
+  only `UnmarshalBencode` works everywhere except as a key, which has to be
+  learned rather than deduced.
 - **Depth cap on the field-tree walk.** Cycle detection bounds the walk, but a
   pathological generated type could still produce a very wide map. No limit is
   specified; add one only if a real type ever needs it.

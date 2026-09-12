@@ -3,6 +3,7 @@ package bencode
 import (
 	"bufio"
 	"bytes"
+	"encoding"
 	"errors"
 	"fmt"
 	"io"
@@ -49,9 +50,16 @@ var (
 
 type RawMessage []byte
 
-var rawMessageType = reflect.TypeFor[RawMessage]()
+var (
+	rawMessageType      = reflect.TypeFor[RawMessage]()
+	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+)
 
 var fieldCache sync.Map // tag: []'field idx'
+
+type Unmarshaler interface {
+	UnmarshalBencode([]byte) error
+}
 
 type SyntaxError struct {
 	Offset int64
@@ -195,6 +203,9 @@ func (d *Decoder) decode(v reflect.Value) error {
 	if v.Type() == rawMessageType {
 		return d.decodeRawValue(v)
 	}
+	if u, ok := customUnmarshaler[Unmarshaler](v); ok {
+		return d.useCustomUnmarshal(v, u)
+	}
 
 	b, err := d.br.ReadByte()
 	if err != nil {
@@ -275,7 +286,9 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 		if k == reflect.Interface {
 			t = reflect.TypeFor[map[string]any]()
 		}
-		if t.Key().Kind() != reflect.String {
+		tKey := t.Key()
+		tKeyIsText := reflect.PointerTo(tKey).Implements(textUnmarshalerType)
+		if tKey.Kind() != reflect.String && !tKeyIsText {
 			return &TypeError{Offset: d.off, Value: "dict", Type: t, cause: ErrTypeMismatch}
 		}
 		m := reflect.MakeMap(t)
@@ -289,12 +302,22 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 				break
 			}
 
+			keyPtr := reflect.New(tKey)
+			rvKey := keyPtr.Elem()
+			if tKeyIsText {
+				if err := keyPtr.Interface().(encoding.TextUnmarshaler).UnmarshalText(key); err != nil {
+					return &TypeError{Offset: d.off, Value: "dict", Type: t, cause: err}
+				}
+			} else {
+				rvKey.SetString(string(key))
+			}
+
 			fieldDst := reflect.New(t.Elem())
 			if err := d.decode(fieldDst.Elem()); err != nil {
 				return err
 			}
 
-			m.SetMapIndex(reflect.ValueOf(key).Convert(t.Key()), fieldDst.Elem())
+			m.SetMapIndex(rvKey, fieldDst.Elem())
 		}
 		v.Set(m)
 	default:
@@ -596,6 +619,14 @@ func (d *Decoder) decodeString(v reflect.Value) error {
 			err = io.ErrUnexpectedEOF
 		}
 		return &TypeError{Offset: d.off, Value: "string", Type: t, cause: err}
+	}
+
+	if u, ok := customUnmarshaler[encoding.TextUnmarshaler](v); ok {
+		err := u.UnmarshalText(str)
+		if err != nil {
+			return &TypeError{Offset: d.off, Value: "string", Type: t, cause: err}
+		}
+		return nil
 	}
 
 	switch k := v.Kind(); {
@@ -932,16 +963,38 @@ func (d *Decoder) fixLimits() {
 	}
 }
 
+func (d *Decoder) useCustomUnmarshal(v reflect.Value, u Unmarshaler) error {
+	raw, err := d.readContainer()
+	if err != nil {
+		return fillType(err, v.Type())
+	}
+
+	err = u.UnmarshalBencode(raw)
+	if err != nil {
+		return &TypeError{Offset: d.off, Type: v.Type(), cause: err}
+	}
+	return nil
+}
+
 func (d *Decoder) decodeRawValue(v reflect.Value) error {
+	raw, err := d.readContainer()
+	if err != nil {
+		return fillType(err, rawMessageType)
+	}
+	v.SetBytes(slices.Clone(raw))
+	return nil
+}
+
+func (d *Decoder) readContainer() ([]byte, error) {
 	_, err := d.br.Peek(1) // §5.3
 	if err != nil {
 		isEOF := errors.Is(err, io.EOF)
 		if isEOF && d.depth > 1 {
-			return io.ErrUnexpectedEOF
+			return nil, io.ErrUnexpectedEOF
 		} else if isEOF {
-			return err
+			return nil, err
 		}
-		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
+		return nil, &TypeError{Offset: d.off, cause: err}
 	}
 	startOffset := d.offset()
 	d.captureStartOff = startOffset
@@ -954,15 +1007,14 @@ func (d *Decoder) decodeRawValue(v reflect.Value) error {
 	defer func() { d.depth++ }() // compensate defer depth--
 	err = d.skipValue()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	endOffset := d.offset()
 	raw, err := d.rec.getBuf(startOffset, endOffset)
 	if err != nil {
-		return &TypeError{Offset: d.off, Type: rawMessageType, cause: err}
+		return nil, &TypeError{Offset: d.off, cause: err}
 	}
-	v.SetBytes(slices.Clone(raw))
-	return nil
+	return raw, nil
 }
 
 func (d *Decoder) offset() int64 {
@@ -1040,6 +1092,7 @@ func (r *recorder) resetBuf() {
 	}
 }
 
+// indirect unwraps pointers, if nil set zero value.
 func indirect(v reflect.Value) reflect.Value {
 	for {
 		switch v.Kind() {
@@ -1066,4 +1119,32 @@ func indirectType(t reflect.Type) reflect.Type {
 			return t
 		}
 	}
+}
+
+func fillType(err error, rt reflect.Type) error {
+	if te, ok := errors.AsType[*TypeError](err); ok {
+		if te.Type == nil {
+			te.Type = rt
+		}
+	}
+
+	return err
+}
+
+func customUnmarshaler[T any](v reflect.Value) (T, bool) {
+	var zero T
+
+	if v.Kind() != reflect.Pointer && v.CanAddr() {
+		v = v.Addr()
+	}
+
+	if !v.CanInterface() {
+		return zero, false
+	}
+
+	u, ok := v.Interface().(T)
+	if !ok {
+		return zero, false
+	}
+	return u, true
 }

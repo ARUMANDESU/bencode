@@ -85,12 +85,58 @@ resolves it with an explicit tag, both are dropped rather than one silently winn
 | integer | `int`, `int8`...`int64`, `uint`...`uint64`, `float32`, `float64`, `bool`, `any` (as `int64`) |
 | string | `string`, `[]byte` (fresh copy), `[N]byte` (length must match exactly), `any` (as `string`) |
 | list | `[]T`, `[N]T` (length must match exactly), `any` (as `[]any`) |
-| dict | struct, `map[string]T`, any map with a string-kinded key, `any` (as `map[string]any`) |
+| dict | struct, `map[string]T`, any map with a string-kinded key or a `TextUnmarshaler` key, `any` (as `map[string]any`) |
 
 Pointers are allocated and followed. Values too large for the destination give
 `ErrOverflow`, not a truncated result. Arrays are strict in both directions: a `[20]byte`
 destination is a statement that the value is exactly 20 bytes, which is what you want for
 a SHA-1 and a peer ID.
+
+## Custom unmarshaling
+
+Two escape hatches for types the table above cannot express.
+
+`bencode.Unmarshaler` receives the verbatim bytes of the whole value — prefix, length
+and terminator included — and fires on any bencode type:
+
+```go
+type Duration time.Duration
+
+func (d *Duration) UnmarshalBencode(b []byte) error {
+	var secs int64
+	if err := bencode.Unmarshal(b, &secs); err != nil {
+		return err
+	}
+	*d = Duration(time.Duration(secs) * time.Second)
+	return nil
+}
+```
+
+`encoding.TextUnmarshaler` receives the string's content with the length prefix stripped,
+and fires only on a bencode string. Nothing to implement for the types that already have
+it:
+
+```go
+type Peer struct {
+	IP   netip.Addr `bencode:"ip"`   // via UnmarshalText
+	Port uint16     `bencode:"port"`
+}
+```
+
+It is also what lets a map key be something other than a string, since bencode dict keys
+arrive as strings and have to be parsed into the key type:
+
+```go
+var peers map[netip.Addr]Peer
+```
+
+`Unmarshaler` wins over `TextUnmarshaler` when a type has both. A `TextUnmarshaler` that
+meets an integer or a list gets `ErrTypeMismatch` rather than an invented string — its
+contract is text.
+
+One caveat, the same one `encoding/json` carries: the slice handed to
+`UnmarshalBencode` is the decoder's buffer and is only valid for the duration of the
+call. Copy it if you keep it.
 
 ## RawMessage
 

@@ -373,7 +373,7 @@ func TestSpec5_2_StructuredErrors(t *testing.T) {
 			assert.Equal(t, reflect.TypeFor[string](), te.Type)
 		})
 
-		// SPEC §11 lists Struct/Field as an open decision. If they are dropped
+		// SPEC §12 lists Struct/Field as an open decision. If they are dropped
 		// from TypeError, delete this subtest with them — do not weaken it to
 		// "may or may not be set", which asserts nothing.
 		t.Run("struct and field name when reached through a struct", func(t *testing.T) {

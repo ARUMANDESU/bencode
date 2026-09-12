@@ -14,7 +14,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// SPEC §10.1 — concurrency
+// SPEC §11.1 — concurrency
 // ---------------------------------------------------------------------------
 
 // The field map cache (§3.3.2) is shared across every decoder in the process,
