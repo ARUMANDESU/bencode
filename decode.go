@@ -267,10 +267,10 @@ func (d *Decoder) decodeDict(v reflect.Value) error {
 
 			field, ft := v, t
 			for i, idx := range idxs {
-				field = indirect(field).Field(idx)
 				if i > 0 {
-					ft = indirectType(ft.Field(idx).Type)
+					ft = indirectType(ft.Field(idxs[i-1]).Type)
 				}
+				field = indirect(field).Field(idx)
 			}
 
 			if err := d.decode(field); err != nil {
