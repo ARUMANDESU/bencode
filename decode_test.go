@@ -320,7 +320,7 @@ type boolField struct {
 // length prefixes and unbalanced 'e's produce tests that pass for the wrong
 // reason. Raw strings are used only where the point of the test IS the exact
 // bytes.
-func mustEncode(t *testing.T, v bencodeast.Value) string {
+func mustEncode(t testing.TB, v bencodeast.Value) string {
 	t.Helper()
 	var buf bytes.Buffer
 	require.NoError(t, bencodeast.Encode(&buf, v))
