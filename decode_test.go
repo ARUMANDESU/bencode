@@ -30,6 +30,7 @@ import (
 //	decode_custom_test.go       §10 custom unmarshaling
 //	decode_integration_test.go  §11.1 concurrency, real torrent files
 //	decode_fuzz_test.go         fuzz targets
+//	decode_bench_test.go        benchmark tests
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -325,6 +326,18 @@ func mustEncode(t testing.TB, v bencodeast.Value) string {
 	var buf bytes.Buffer
 	require.NoError(t, bencodeast.Encode(&buf, v))
 	return buf.String()
+}
+
+func mustEncodeBytes(t testing.TB, v bencodeast.Value) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, bencodeast.Encode(&buf, v))
+	return buf.Bytes()
+}
+
+func mustUnmarshal(t testing.TB, data []byte, dst any) {
+	t.Helper()
+	require.NoError(t, Unmarshal(data, dst))
 }
 
 // decode runs one value through a fresh Decoder.
