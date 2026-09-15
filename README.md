@@ -226,5 +226,5 @@ The decoder is done and covered by tests, including real `.torrent` files. Rough
 still being filed down, so the API may shift before a v1 tag. Encoding is not implemented
 yet and is the next thing on the list. There are no benchmarks yet either.
 
-`SPEC_decoder.md` is the authority on decoder behaviour. Where the code and the spec
+`docs/SPEC_decoder.md` is the authority on decoder behaviour. Where the code and the spec
 disagree, the spec is right and the code has a bug.
