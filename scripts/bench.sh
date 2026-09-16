@@ -3,6 +3,7 @@ set -euo pipefail
 
 # # What does this script do?
 # run benchmark tests and store everything in $BENCH_DIR
+# can specify this vars in env: BENCH_DIR and BENCH_COUNT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -16,6 +17,7 @@ OUT_FILE="$BENCH_DIR/bench_${TIMESTAMP}_${GIT_COMMIT}.txt"
 BENCH_COUNT="${BENCH_COUNT:-1}"
 
 echo "Running Go benchmarks..." >&2
+echo "Count: $BENCH_COUNT" >&2
 echo "Repo root:   $REPO_ROOT" >&2
 echo "Git commit hash: $GIT_COMMIT" >&2
 echo "Output file: $OUT_FILE" >&2
