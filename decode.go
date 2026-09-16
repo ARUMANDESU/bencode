@@ -108,6 +108,15 @@ type Limits struct {
 	MaxDepth        uint
 }
 
+func defaultLimits() Limits {
+	return Limits{
+		MaxStringBytes:  DefaultMaxStringBytes,
+		MaxValueBytes:   DefaultMaxValueBytes,
+		MaxCaptureBytes: DefaultMaxCaptureBytes,
+		MaxDepth:        DefaultMaxRecursionDepth,
+	}
+}
+
 type Decoder struct {
 	Limits Limits
 
@@ -124,14 +133,9 @@ type Decoder struct {
 func NewDecoder(r io.Reader) *Decoder {
 	rec := recorder{src: r}
 	d := Decoder{
-		br:  bufio.NewReader(&rec),
-		rec: &rec,
-		Limits: Limits{
-			MaxStringBytes:  DefaultMaxStringBytes,
-			MaxValueBytes:   DefaultMaxValueBytes,
-			MaxCaptureBytes: DefaultMaxCaptureBytes,
-			MaxDepth:        DefaultMaxRecursionDepth,
-		},
+		br:     bufio.NewReader(&rec),
+		rec:    &rec,
+		Limits: defaultLimits(),
 	}
 	return &d
 }
