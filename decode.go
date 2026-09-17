@@ -67,6 +67,13 @@ var unmarshalStatePool = &sync.Pool{
 	},
 }
 
+// Unmarshaler is implemented by types that decode themselves from the verbatim
+// bytes of a bencode value - prefix, length and terminator included.
+//
+// The slice is the implementation's to keep. It never aliases a decoder buffer,
+// so it may be retained and mutated, and stays valid after the call returns.
+// This is deliberately unlike [encoding/json.Unmarshaler], which lends its
+// bytes only for the duration of the call.
 type Unmarshaler interface {
 	UnmarshalBencode([]byte) error
 }

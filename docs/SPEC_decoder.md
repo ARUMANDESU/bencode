@@ -993,18 +993,28 @@ must not probe one interface and cast the result into the other: a type
 implementing exactly one of the two — which is every type named in §10.1 —
 then panics out of `Decode`. §8 records this.
 
-### 10.3 The bytes are borrowed, not given
+### 10.3 The bytes are given, not borrowed
 
-The slice passed to `UnmarshalBencode` aliases the decoder's capture buffer and
-is valid **only for the duration of the call**. An implementation that wants to
-retain it must copy it.
+The slice passed to `UnmarshalBencode` never aliases the decoder's capture
+buffer. The implementation may retain and mutate it freely, and it stays valid
+after the call returns and after the decoder that produced it is reused or
+discarded.
 
-This is the one place §9.2 rule 3's ownership guarantee does not extend.
-`RawMessage` copies because the value escapes into the caller's struct and
-outlives the decode; an `Unmarshaler` is handed the buffer while it is still
-live, and the overwhelmingly common implementation parses and discards. Paying
-for a copy on every value to protect the rare retainer is the wrong trade, and
-it is the trade `encoding/json` makes for `UnmarshalJSON` too.
+This extends §9.2 rule 3's ownership guarantee to the whole custom-unmarshaling
+surface, so there is no rule to learn: nothing the decoder hands out points into
+memory it will reuse. `encoding/json` draws the opposite line for
+`UnmarshalJSON` and documents the slice as borrowed, which is a defensible trade
+when the common implementation parses and discards — but it is a trade that
+buys a copy elided in the common case at the price of a silent, undiagnosable
+corruption in the uncommon one. A retained borrow produces no error, no panic
+and no test failure; it produces wrong bytes much later. Bencode's capture path
+already allocates, so the copy is one `slices.Clone` on a value the caller
+explicitly asked to see verbatim, and the failure mode it buys off is the worst
+kind this decoder has.
+
+The guarantee is unconditional. It is not "the decoder currently copies" — an
+implementation that stopped copying would be violating this section, not
+optimizing it.
 
 Capture runs on §9.3's machinery, so `MaxCaptureBytes` (§7.1) bounds an
 `Unmarshaler` value exactly as it bounds a `RawMessage`, and recording is
@@ -1149,10 +1159,6 @@ Recorded so they are not silently defaulted:
   problem because its ecosystem types implement `json.Unmarshaler` as well.
   That is luck, not design, and bencode has no equivalent luck. Decide before
   v1; `decode_custom_test.go` holds a skipped test for the fixed behaviour.
-- **Borrowed bytes (§10.3).** An `Unmarshaler` that retains the slice it was
-  given sees it overwritten later, with no diagnostic. A build-tag-guarded mode
-  that hands out a copy, or scribbles over the buffer after the call, would
-  turn that into a test failure instead of a field report. Cheap; not done.
 - **`Unmarshaler` for map keys (§10.4).** Rejected on the grounds that a key is
   always a string. The counter-argument is uniformity: a type that implements
   only `UnmarshalBencode` works everywhere except as a key, which has to be
