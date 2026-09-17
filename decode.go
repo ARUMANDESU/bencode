@@ -57,6 +57,16 @@ var (
 
 var fieldCache sync.Map // tag: []'field idx'
 
+var unmarshalStatePool = &sync.Pool{
+	New: func() any {
+		s := &unmarshalState{}
+		s.rec.src = &s.src
+		s.decoder.rec = &s.rec
+		s.decoder.br = bufio.NewReader(&s.rec)
+		return s
+	},
+}
+
 type Unmarshaler interface {
 	UnmarshalBencode([]byte) error
 }
@@ -117,6 +127,22 @@ func defaultLimits() Limits {
 	}
 }
 
+type unmarshalState struct {
+	decoder Decoder
+	rec     recorder
+	src     bytes.Reader
+}
+
+func (s *unmarshalState) reset(b []byte) {
+	s.src.Reset(b)
+	s.rec.pulled = 0
+	s.rec.base = 0
+	s.rec.off()
+	s.rec.resetBuf() // rec buf resets if cap > [maxRecBufRetained]
+	s.decoder.br.Reset(&s.rec)
+	s.decoder = Decoder{Limits: defaultLimits(), br: s.decoder.br, rec: &s.rec}
+}
+
 type Decoder struct {
 	Limits Limits
 
@@ -141,7 +167,13 @@ func NewDecoder(r io.Reader) *Decoder {
 }
 
 func Unmarshal(b []byte, v any) error {
-	d := NewDecoder(bytes.NewReader(b))
+	s := unmarshalStatePool.Get().(*unmarshalState)
+	defer func() {
+		s.reset(nil)
+		unmarshalStatePool.Put(s)
+	}()
+	s.reset(b)
+	d := s.decoder
 	err := d.Decode(v)
 	if err != nil {
 		return err
