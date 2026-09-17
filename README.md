@@ -134,9 +134,10 @@ var peers map[netip.Addr]Peer
 meets an integer or a list gets `ErrTypeMismatch` rather than an invented string — its
 contract is text.
 
-One caveat, the same one `encoding/json` carries: the slice handed to
-`UnmarshalBencode` is the decoder's buffer and is only valid for the duration of the
-call. Copy it if you keep it.
+The slice handed to `UnmarshalBencode` is yours. Retain it, mutate it, keep it past the
+call — it never aliases a decoder buffer. This is the opposite of what `encoding/json`
+promises for `UnmarshalJSON`, deliberately: a retained borrow there fails silently and
+late, and the copy costs one allocation on a value you already asked to see verbatim.
 
 ## RawMessage
 
@@ -220,11 +221,34 @@ for {
 
 Once the decoder returns `io.EOF` it returns it forever, so the loop cannot spin.
 
+## Performance
+
+For input you already hold in memory, `Unmarshal` is the cheaper entry point. It draws its
+decoder state from a pool, so a call does not pay for a fresh 4 KiB buffered reader the way
+`bencode.NewDecoder(bytes.NewReader(b)).Decode(v)` does. The saving is a fixed cost per
+call, so it dominates on small values and fades on large ones.
+
+The pooled state is never visible to you. Strings, `[]byte` fields, dict keys, `RawMessage`
+captures and the argument to `UnmarshalBencode` are all freshly allocated, so nothing the
+decoder hands out points into memory that a later call reuses.
+
+Benchmarks live in `decode_bench_test.go` and cover integers, strings from 8 B to 7 MB,
+dicts from 8 to 1024 keys, and real `.torrent` files:
+
+```
+make bench                  # writes bench_results/bench_<timestamp>_<commit>.txt
+make bench BENCH_COUNT=20   # more samples for a comparison worth trusting
+make bench-compare          # benchstat over the two most recent runs
+```
+
+Comparing needs [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat). Results
+land in `bench_results/`, which is gitignored.
+
 ## Status
 
 The decoder is done and covered by tests, including real `.torrent` files. Rough edges are
 still being filed down, so the API may shift before a v1 tag. Encoding is not implemented
-yet and is the next thing on the list. There are no benchmarks yet either.
+yet and is the next thing on the list.
 
 `docs/SPEC_decoder.md` is the authority on decoder behaviour. Where the code and the spec
 disagree, the spec is right and the code has a bug.
