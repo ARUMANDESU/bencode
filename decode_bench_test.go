@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	bencodeast "github.com/arumandesu/bencode/pkg/bencode_ast"
-	"github.com/stretchr/testify/require"
 )
 
 // repeatedString returns a bencoded string of exactly n bytes of payload.
@@ -36,14 +35,16 @@ func BenchmarkInt(b *testing.B) {
 		{"19bytes", []byte("i1234567890123456789e")},
 	}
 
-	b.ResetTimer()
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
 			b.SetBytes(int64(len(tt.data)))
 			b.ReportAllocs()
 			for b.Loop() {
 				var got int
-				mustUnmarshal(b, tt.data, &got)
+				err := Unmarshal(tt.data, &got)
+				if err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
@@ -60,14 +61,16 @@ func BenchmarkString(b *testing.B) {
 		{"7MB", repeatedString(b, 7<<20)},
 	}
 
-	b.ResetTimer()
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
 			b.SetBytes(int64(len(tt.data)))
 			b.ReportAllocs()
 			for b.Loop() {
 				var got string
-				mustUnmarshal(b, tt.data, &got)
+				err := Unmarshal(tt.data, &got)
+				if err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
@@ -86,14 +89,16 @@ func BenchmarkMap(b *testing.B) {
 		{"1024keys", mapWithNumOfKeys(b, 1024)},
 	}
 
-	b.ResetTimer()
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
 			b.SetBytes(int64(len(tt.data)))
 			b.ReportAllocs()
 			for b.Loop() {
 				var got map[string]any
-				mustUnmarshal(b, tt.data, &got)
+				err := Unmarshal(tt.data, &got)
+				if err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
@@ -101,14 +106,16 @@ func BenchmarkMap(b *testing.B) {
 
 func BenchmarkMapDestination(b *testing.B) {
 	in := mapWithNumOfKeys(b, 64)
-	b.ResetTimer()
 
 	b.Run("map", func(b *testing.B) {
 		b.SetBytes(int64(len(in)))
 		b.ReportAllocs()
 		for b.Loop() {
 			var got map[string]any
-			mustUnmarshal(b, in, &got)
+			err := Unmarshal(in, &got)
+			if err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 
@@ -122,7 +129,10 @@ func BenchmarkMapDestination(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			var got dst
-			mustUnmarshal(b, in, &got)
+			err := Unmarshal(in, &got)
+			if err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 
@@ -131,7 +141,10 @@ func BenchmarkMapDestination(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			var got RawMessage
-			mustUnmarshal(b, in, &got)
+			err := Unmarshal(in, &got)
+			if err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }
@@ -168,6 +181,8 @@ func BenchmarkDecoderTorrent(b *testing.B) {
 	for b.Loop() {
 		var got torrentMeta
 		err := NewDecoder(bytes.NewReader(in)).Decode(&got)
-		require.NoError(b, err)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -335,11 +335,6 @@ func mustEncodeBytes(t testing.TB, v bencodeast.Value) []byte {
 	return buf.Bytes()
 }
 
-func mustUnmarshal(t testing.TB, data []byte, dst any) {
-	t.Helper()
-	require.NoError(t, Unmarshal(data, dst))
-}
-
 // decode runs one value through a fresh Decoder.
 //
 // A panic is never a valid outcome (SPEC §8): callers cannot recover from one,
